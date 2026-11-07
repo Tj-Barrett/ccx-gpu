@@ -59,6 +59,15 @@ ccx with CMake against an existing PaStiX/PaRSEC installation.
 | `PASTIX_ORDERING=metis` | METIS nested dissection instead of Scotch (needs `CCX_PASTIX_METIS`); default Scotch. ccx prints the ordering in use |
 | `PASTIX_MIXED_PRECISION=0` | factorize in FP64 (default in ccx: FP32 factorization + GMRES refinement to FP64 accuracy) |
 | `OMP_NUM_THREADS` | CPU threads |
+| `CCX_PARDISO_OOC=1` | PARDISO out-of-core when its factor does not fit in the in-core limit; `=2` always; default `0` in-core |
+| `MKL_PARDISO_OOC_MAX_CORE_SIZE` | in-core limit in MB; if unset with `CCX_PARDISO_OOC`, ccx sets it to `CCX_PARDISO_OOC_FRACTION` (default 0.5) of the available RAM |
+| `MKL_PARDISO_OOC_PATH` | prefix of the out-of-core factor files (default `./ooc_temp`, removed at the end); needs free disk of about the factor size |
+
+**PARDISO out-of-core** (31 GB machine, C3D10 RVE, one linear step with a UMAT, so two
+factorizations): 1.87M equations, which do not fit in-core, take 1097 s and 15.5 GB of RAM with a
+16.5 GB factor file, matching `ITERATIVE CHOLESKY` to 1e-8. At 2.93M equations the factor
+grows to 56 GB on disk and one factorization took 3.4 h, against 16 min for `ITERATIVE
+CHOLESKY`. Out-of-core is worth it just above the in-core limit, not far beyond it.
 
 **Note:** when PaStiX is compiled in, it becomes ccx's default solver for
 `*STATIC` without `SOLVER=` (CalculiX's own priority, `ini_cal.c`). Use a
@@ -214,6 +223,13 @@ factorization was about 1e-2 instead of 1e-8. `mymaster` honours it.
    stalled at 2.4e-11 on fresh double-precision factorizations, and ccx
    exited. A solution whose relative residual is below 1e-9 is now accepted
    with a note.
+6. PARDISO: refine further and accept round-off-level solves. With a UMAT, ccx
+   runs a second Newton iteration even in a linear step, and PARDISO's refinement
+   can stall on its round-off right-hand side (-4). Up to 20 more refinement steps
+   from the assembled matrix; accepted below 1e-10, or below 1e-6 with a note.
+7. PaStiX: ordering selected at run time with `PASTIX_ORDERING` (Scotch or METIS).
+8. PARDISO: optional out-of-core factorization (`CCX_PARDISO_OOC`, see Use). Upstream
+   runs PARDISO in-core only.
 
 **Integer size.** PaStiX is built with 64-bit integers (`PASTIX_INT64=ON`)
 against the distribution's 64-bit Scotch (`scotch-int64`, linked statically because

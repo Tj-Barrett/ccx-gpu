@@ -1,0 +1,99 @@
+From: tj-barrett <barrett.t@northeastern.edu>
+Subject: [PATCH] pardiso.c: optional out-of-core factorization
+
+PARDISO ran in-core only (iparm[59]=0). On a 31 GB machine that stops it at about
+1.4M equations of a C3D10 RVE (1.98M-DOF model: out of RAM; 3.09M: error -2).
+
+CCX_PARDISO_OOC=1 sets iparm[59]=1 (out-of-core when the factor exceeds
+MKL_PARDISO_OOC_MAX_CORE_SIZE), =2 always out-of-core; the default 0 leaves the
+behaviour unchanged. MKL's default in-core limit is 2000 MB, so when
+MKL_PARDISO_OOC_MAX_CORE_SIZE is not set it is set to CCX_PARDISO_OOC_FRACTION
+(default 0.5) of MemAvailable at the first factorization. ccx prints the mode,
+the limit, and the memory PARDISO holds in core.
+
+Verified: 0.22M DOF, modes 0/1/2 give .dat files bitwise identical to the
+unpatched in-core solve. 1.98M DOF (1.87M equations), mode 1: 1097 s, 15.5 GB
+peak RSS, 16.5 GB factor file; stresses agree with ITERATIVE CHOLESKY to 1.1e-8.
+3.09M DOF (2.93M equations): the factor is 56 GB on disk and one factorization
+took 3.4 h (ITERATIVE CHOLESKY: 949 s), so out-of-core helps just above the
+in-core limit, not far beyond it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+diff --git a/ccx_2.23/src/pardiso.c b/ccx_2.23/src/pardiso.c
+index 32c2978..ef1e731 100644
+--- a/ccx_2.23/src/pardiso.c
++++ b/ccx_2.23/src/pardiso.c
+@@ -31,6 +31,51 @@ ITG *icolpardiso=NULL,*pointers=NULL,iparm[64];
+ long long pt[64];
+ double *aupardiso=NULL;
+ 
++/* Out-of-core factorization, requested with CCX_PARDISO_OOC (default 0: in-core):
++     1  out-of-core only when the factor exceeds MKL_PARDISO_OOC_MAX_CORE_SIZE (MB)
++     2  always out-of-core
++   MKL's default MKL_PARDISO_OOC_MAX_CORE_SIZE is 2000 MB, which would send any
++   large model to disk; when it is not set, it is set here to CCX_PARDISO_OOC_FRACTION
++   (default 0.5) of the RAM available at the first factorization, after ccx's own
++   arrays are allocated. MKL writes the factor to MKL_PARDISO_OOC_PATH (default
++   ./ooc_temp.*, deleted at the end), so the job directory needs free disk of about
++   the factor size. */
++static ITG pardiso_ooc_mode(void){
++  static ITG mode=-1;
++  char *env,buf[32];
++  if(mode>=0) return mode;
++  mode=0;
++  env=getenv("CCX_PARDISO_OOC");
++  if(env!=NULL) mode=atoi(env);
++  if(mode<0 || mode>2){
++    printf(" *WARNING in pardiso: CCX_PARDISO_OOC=%s ignored (0, 1 or 2)\n",env);
++    mode=0;
++  }
++  if(mode==0) return mode;
++  if(getenv("MKL_PARDISO_OOC_MAX_CORE_SIZE")==NULL){
++    double frac=0.5;
++    long long availkb=0,v;
++    char line[256];
++    FILE *f=fopen("/proc/meminfo","r");
++    env=getenv("CCX_PARDISO_OOC_FRACTION");
++    if(env!=NULL && atof(env)>0. && atof(env)<1.) frac=atof(env);
++    if(f!=NULL){
++      while(fgets(line,sizeof(line),f)!=NULL){
++        if(sscanf(line,"MemAvailable: %lld kB",&v)==1){availkb=v;break;}
++      }
++      fclose(f);
++    }
++    if(availkb>0){
++      snprintf(buf,sizeof(buf),"%lld",(long long)(frac*availkb/1024.));
++      setenv("MKL_PARDISO_OOC_MAX_CORE_SIZE",buf,1);
++    }
++  }
++  env=getenv("MKL_PARDISO_OOC_MAX_CORE_SIZE");
++  printf(" pardiso: out-of-core mode %" ITGFORMAT ", in-core limit %s MB\n",mode,
++         env!=NULL ? env : "(MKL default 2000)");
++  return mode;
++}
++
+ /* PARDISO parameters. ccx used to pass iparm[0]=0 (all defaults): for the symmetric
+    indefinite systems of periodic RVEs that perturbs small pivots without scaling or
+    matching, and the result was not checked; at ~1.5M equations it returned a solution
+@@ -47,6 +92,7 @@ static void pardiso_set_iparm(ITG mtype){
+   iparm[10]=1;                       /* scaling */
+   iparm[12]=1;                       /* weighted matching */
+   iparm[20]=1;                       /* Bunch-Kaufman pivoting (symmetric indefinite) */
++  iparm[59]=pardiso_ooc_mode();      /* in-core (0), out-of-core if needed (1), always (2) */
+ }
+ 
+ /* normwise backward error |b-Ax|_inf / (|A|_inf |x|_inf + |b|_inf) of a solution,
+@@ -364,6 +410,12 @@ void pardiso_factor(double *ad, double *au, double *adb, double *aub,
+   if(iparm[13]>0){
+     printf(" pardiso: %" ITGFORMAT " perturbed pivots\n",iparm[13]);
+   }
++  if(iparm[59]>0){
++    /* iparm[14..16] (kB): peak analysis memory; permanent + factorization memory held
++       in core (with out-of-core, the factor itself is on disk and can be much larger) */
++    printf(" pardiso: memory in core %.1f GB, peak analysis %.1f GB\n",
++           (iparm[15]+iparm[16])/1048576.,iparm[14]/1048576.);
++  }
+ 
+   return;
+ }
