@@ -1,0 +1,31 @@
+From 682937ced62dbdd70ebb4939cb46b4af4a0511bd Mon Sep 17 00:00:00 2001
+From: tj-barrett <barrett.t@northeastern.edu>
+Date: Thu, 15 Oct 2026 21:21:34 -0400
+Subject: [PATCH 2/4] Make DPLASMA optional (PARSEC_WITH_DPLASMA, default OFF)
+
+DPLASMA is not needed by PaStiX and its precision generator requires Python 2 / 2to3.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CMakeLists.txt | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index cb86c2784..65db5a5ea 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -1085,7 +1085,10 @@ foreach( pattern_file ${pattern_files} )
+ endforeach( pattern_file )
+ add_custom_target(build_with_parsec ALL DEPENDS ${pattern_files_dest})
+ 
+-add_subdirectory(dplasma)
++option(PARSEC_WITH_DPLASMA "Build DPLASMA" OFF)
++if(PARSEC_WITH_DPLASMA)
++  add_subdirectory(dplasma)
++endif()
+ 
+ # build doxygen documentation. Keep this at the end to make sure all temporary
+ # variables (such as the DPLASMA documentation) are correctly initialized.
+-- 
+2.43.0
+

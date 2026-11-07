@@ -1,0 +1,30 @@
+From f2eb97fc2a1a8d3114eb97473e203de72d2dc3f6 Mon Sep 17 00:00:00 2001
+From: tj-barrett <barrett.t@northeastern.edu>
+Date: Thu, 15 Oct 2026 21:21:35 -0400
+Subject: [PATCH 3/6] Accept Threads::Threads in CUDA_LIBRARIES
+
+FindCUDA in current CMake adds the Threads imported target, which the morse helper
+tried to resolve as a library file and aborted.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../morse_cmake/modules/find/LibrariesAbsolutePath.cmake       | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/cmake_modules/morse_cmake/modules/find/LibrariesAbsolutePath.cmake b/cmake_modules/morse_cmake/modules/find/LibrariesAbsolutePath.cmake
+index eb59c11..aed5ee5 100644
+--- a/cmake_modules/morse_cmake/modules/find/LibrariesAbsolutePath.cmake
++++ b/cmake_modules/morse_cmake/modules/find/LibrariesAbsolutePath.cmake
+@@ -41,6 +41,9 @@ macro(LIBRARIES_ABSOLUTE_PATH lib_list hints_paths)
+     if(EXISTS "${_library}")
+       # if already an absolute path, nothing special to do
+       list(APPEND ${lib_list} ${_library})
++    elseif("${_library}" STREQUAL "Threads::Threads")
++      # modern FindCUDA adds the Threads imported target
++      list(APPEND ${lib_list} "-lpthread")
+     else()
+       # replace pattern -lfoo -> foo
+       string(REGEX REPLACE "^-l" "" _library "${_library}")
+-- 
+2.43.0
+

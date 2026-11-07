@@ -1,0 +1,44 @@
+From: tj-barrett <barrett.t@northeastern.edu>
+Subject: [PATCH] pastix.c: read PASTIX_GPU as the number of GPUs
+
+PASTIX_GPU was an on/off switch ('1' enabled one GPU), so PaStiX could never be
+asked for more than one GPU. Read it as a count instead (PASTIX_GPU=2 for two GPUs,
+0 or unset for CPU only, clamped to 0..16). PASTIX_GPU=1 behaves as before.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+--- a/ccx_2.23/src/pastix.c
++++ b/ccx_2.23/src/pastix.c
+@@ -62,6 +62,14 @@
+ double *aupastix=NULL;
+ spm_int_t *icolpastix=NULL,*irowpastix=NULL;
+ 
++// PASTIX_GPU=<n>: number of GPUs PaStiX may use (0 = CPU only); not a number counts as 0
++static char pastix_gpu_count(const char *env){
++    int n = atoi(env);
++    if(n < 0) n = 0;
++    if(n > 16) n = 16;
++    return (char) n;
++}
++
+ static void copy_itg_to_spm(spm_int_t *dst, const ITG *src, ITG n){
+     ITG j;
+     for(j=0;j<n;j++) dst[j]=src[j];
+@@ -773,7 +781,7 @@
+ 	// Set GPU flag from environment
+ 	const char* pastix_gpu = getenv("PASTIX_GPU");
+ 	if(pastix_gpu)
+-		gpu = ( mode == AS || mode == CP ) ? 0 : (*pastix_gpu == '1') ? 1 : 0;
++		gpu = ( mode == AS || mode == CP ) ? 0 : pastix_gpu_count(pastix_gpu);
+ 	
+ 	// Perform individual invocations always in double precision. If previous iterations were in single precision, do not reuse.
+ 	forceRedo=1;
+@@ -988,7 +996,7 @@
+ 	
+ 	const char* pastix_gpu = getenv("PASTIX_GPU");
+ 	if(pastix_gpu)
+-		gpu = (*pastix_gpu == '1') ? 1 : 0;
++		gpu = pastix_gpu_count(pastix_gpu);
+ 
+     usage = SINGLE_SOLVE;
+ 	

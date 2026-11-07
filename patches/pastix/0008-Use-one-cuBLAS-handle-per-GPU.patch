@@ -1,0 +1,220 @@
+From 1d2808829c1f0fd0bece522589110c67d4841a2a Mon Sep 17 00:00:00 2001
+From: tj-barrett <barrett.t@northeastern.edu>
+Date: Thu, 15 Oct 2026 22:17:32 -0400
+Subject: [PATCH] Use one cuBLAS handle per GPU
+
+A single cuBLAS handle was created at initialisation and shared by every GPU task.
+cuBLAS handles are bound to the device that was current when they were created, so
+with IPARM_GPU_NBR > 1 the cuBLAS-based TRSM/GEMM tasks that PaRSEC scheduled on the
+other GPUs used a handle (and workspace) from device 0.
+
+Create one handle for each device PaRSEC enables (0 .. min(IPARM_GPU_NBR, devices)-1)
+and pass cublas_handle + parsec_body.index from the CUDA task bodies. Element 0 is
+still the handle used by the solve and refinement, which run on device 0.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ common/api.c                   | 32 +++++++++++++++++++++++++++-----
+ common/pastixdata.h            |  4 +++-
+ sopalin/parsec/zgetrf_sp2d.jdf |  8 ++++----
+ sopalin/parsec/zhetrf_sp2d.jdf |  2 +-
+ sopalin/parsec/zpotrf_sp2d.jdf |  4 ++--
+ sopalin/parsec/zpxtrf_sp2d.jdf |  4 ++--
+ sopalin/parsec/zsytrf_sp2d.jdf |  6 +++---
+ 7 files changed, 42 insertions(+), 18 deletions(-)
+
+diff --git a/common/api.c b/common/api.c
+index 3d42fb0..01c353b 100644
+--- a/common/api.c
++++ b/common/api.c
+@@ -604,12 +604,30 @@ pastixInitWithAffinity( pastix_data_t **pastix_data,
+     if(iparm[IPARM_GPU_NBR] > 0){
+ 		
+ #ifdef PASTIX_WITH_CUDA
+-		pastix->cublas_handle = (cublasHandle_t*) malloc(sizeof(cublasHandle_t));
++		/*
++		 * A cuBLAS handle is bound to the device that is current when it is created,
++		 * so create one per GPU that PaRSEC will use (devices 0 .. n-1, see
++		 * device_cuda_enabled); GPU tasks pick cublas_handle[parsec_body.index].
++		 */
++		int ndev = 0, curdev = 0, d;
++		if ( cudaGetDeviceCount( &ndev ) != cudaSuccess || ndev < 1 ) {
++			ndev = 1;
++		}
++		if ( ndev > iparm[IPARM_GPU_NBR] ) {
++			ndev = iparm[IPARM_GPU_NBR];
++		}
++		cudaGetDevice( &curdev );
++		pastix->cublas_nhandles = ndev;
++		pastix->cublas_handle = (cublasHandle_t*) malloc(ndev * sizeof(cublasHandle_t));
+ 		pastix->cublas_stat = (cublasStatus_t*) malloc(sizeof(cublasStatus_t));
+-		*(pastix->cublas_stat) = cublasCreate(pastix->cublas_handle);
+-		if (*(pastix->cublas_stat) != CUBLAS_STATUS_SUCCESS) {
+-			printf ("CUBLAS initialization failed\n");
++		for ( d = 0; d < ndev; d++ ) {
++			cudaSetDevice( d );
++			*(pastix->cublas_stat) = cublasCreate( pastix->cublas_handle + d );
++			if (*(pastix->cublas_stat) != CUBLAS_STATUS_SUCCESS) {
++				printf ("CUBLAS initialization failed on device %d\n", d);
++			}
+ 		}
++		cudaSetDevice( curdev );
+ 		cudaStreamCreate(&(pastix->streamGPU));
+ #endif
+ 	}
+@@ -617,6 +635,7 @@ pastixInitWithAffinity( pastix_data_t **pastix_data,
+ 	{
+ 		pastix->cublas_handle = NULL;
+ 		pastix->cublas_stat = NULL;
++		pastix->cublas_nhandles = 0;
+ 	}
+    // *(pastix->cublas_stat) = cublasSetMathMode(*(pastix->cublas_handle), CUBLAS_TENSOR_OP_MATH);
+ 
+@@ -782,7 +801,10 @@ pastixFinalize( pastix_data_t **pastix_data )
+ 	if( pastix->cublas_handle != NULL){
+ 		
+ #ifdef PASTIX_WITH_CUDA
+-		cublasDestroy(*(pastix->cublas_handle));
++		int d;
++		for ( d = 0; d < pastix->cublas_nhandles; d++ ) {
++			cublasDestroy( pastix->cublas_handle[d] );
++		}
+ 		
+ 		free(pastix->cublas_handle);
+ 		free(pastix->cublas_stat);
+diff --git a/common/pastixdata.h b/common/pastixdata.h
+index d225a46..3fec899 100644
+--- a/common/pastixdata.h
++++ b/common/pastixdata.h
+@@ -89,7 +89,9 @@ struct pastix_data_s {
+ 
+     pastix_model_t  *cpu_models;         /**< CPU model coefficients for the kernels                              */
+     pastix_model_t  *gpu_models;         /**< GPU model coefficients for the kernels                              */
+-    cublasHandle_t *cublas_handle;
++    cublasHandle_t *cublas_handle;  /* one per CUDA device used, indexed by device id;
++                                       [0] also serves the solve and refinement   */
++    int             cublas_nhandles;
+     cublasStatus_t *cublas_stat;
+     cudaStream_t    streamGPU;
+ 
+diff --git a/sopalin/parsec/zgetrf_sp2d.jdf b/sopalin/parsec/zgetrf_sp2d.jdf
+index 4d185a9..6bdcdee 100644
+--- a/sopalin/parsec/zgetrf_sp2d.jdf
++++ b/sopalin/parsec/zgetrf_sp2d.jdf
+@@ -442,13 +442,13 @@ BODY [ type=CUDA
+                 gpublok_ztrsmsp( PastixLCoef, PastixRight, PastixUpper,
+                                  PastixNoTrans, PastixNonUnit,
+                                  cblk, m, A, C, &lowrank,
+-                                 parsec_body.stream, cublas_handle );
++                                 parsec_body.stream, cublas_handle + parsec_body.index );
+             }
+             else {
+                 gpublok_ztrsmsp( PastixUCoef, PastixRight, PastixUpper,
+                                  PastixNoTrans, PastixUnit,
+                                  cblk, m, A, C, &lowrank,
+-                                 parsec_body.stream, cublas_handle );
++                                 parsec_body.stream, cublas_handle + parsec_body.index );
+             }
+         }
+     }
+@@ -671,13 +671,13 @@ BODY [ type=CUDA
+                 gpublok_zgemmsp( PastixLCoef, PastixUCoef, PastixTrans,
+                                  cblk, fcblk, blok_mk, nk, blok_mn,
+                                  A, B, C, &lowrank,
+-                                 parsec_body.stream, cublas_handle );
++                                 parsec_body.stream, cublas_handle + parsec_body.index );
+             }
+             else if ( (s == 1) && (blok_mk != nk) ) {
+                 gpublok_zgemmsp( PastixUCoef, PastixLCoef, PastixTrans,
+                                  cblk, fcblk, blok_mk, nk, blok_mn,
+                                  A, B, C, &lowrank,
+-                                 parsec_body.stream, cublas_handle );
++                                 parsec_body.stream, cublas_handle + parsec_body.index );
+             }
+         }
+     }
+diff --git a/sopalin/parsec/zhetrf_sp2d.jdf b/sopalin/parsec/zhetrf_sp2d.jdf
+index 8a235ac..b84c973 100644
+--- a/sopalin/parsec/zhetrf_sp2d.jdf
++++ b/sopalin/parsec/zhetrf_sp2d.jdf
+@@ -624,7 +624,7 @@ BODY [ type=CUDA
+             gpublok_zgemmsp( PastixLCoef, PastixUCoef, PastixTrans,
+                              cblk, fcblk, blok_mk, nk, blok_mn,
+                              A, B, C, &lowrank,
+-                             parsec_body.stream, cublas_handle );
++                             parsec_body.stream, cublas_handle + parsec_body.index );
+         }
+     }
+ }
+diff --git a/sopalin/parsec/zpotrf_sp2d.jdf b/sopalin/parsec/zpotrf_sp2d.jdf
+index 4b4b964..b2a9289 100644
+--- a/sopalin/parsec/zpotrf_sp2d.jdf
++++ b/sopalin/parsec/zpotrf_sp2d.jdf
+@@ -389,7 +389,7 @@ BODY [ type=CUDA
+             gpublok_ztrsmsp( PastixLCoef, PastixRight, PastixLower,
+                              PastixConjTrans, PastixNonUnit,
+                              cblk, m, A, C, &lowrank,
+-                             parsec_body.stream, cublas_handle );
++                             parsec_body.stream, cublas_handle + parsec_body.index );
+         }
+     }
+ }
+@@ -600,7 +600,7 @@ BODY [ type=CUDA
+             gpublok_zgemmsp( PastixLCoef, PastixLCoef, PastixConjTrans,
+                              cblk, fcblk, blok_mk, nk, blok_mn,
+                              A, B, C, &lowrank,
+-                             parsec_body.stream, cublas_handle );
++                             parsec_body.stream, cublas_handle + parsec_body.index );
+         }
+     }
+ }
+diff --git a/sopalin/parsec/zpxtrf_sp2d.jdf b/sopalin/parsec/zpxtrf_sp2d.jdf
+index 82777fe..3737969 100644
+--- a/sopalin/parsec/zpxtrf_sp2d.jdf
++++ b/sopalin/parsec/zpxtrf_sp2d.jdf
+@@ -389,7 +389,7 @@ BODY [ type=CUDA
+             gpublok_ztrsmsp( PastixLCoef, PastixRight, PastixLower,
+                              PastixTrans, PastixNonUnit,
+                              cblk, m, A, C, &lowrank,
+-                             parsec_body.stream, cublas_handle );
++                             parsec_body.stream, cublas_handle + parsec_body.index );
+         }
+     }
+ }
+@@ -600,7 +600,7 @@ BODY [ type=CUDA
+             gpublok_zgemmsp( PastixLCoef, PastixLCoef, PastixTrans,
+                              cblk, fcblk, blok_mk, nk, blok_mn,
+                              A, B, C, &lowrank,
+-                             parsec_body.stream, cublas_handle );
++                             parsec_body.stream, cublas_handle + parsec_body.index );
+         }
+     }
+ }
+diff --git a/sopalin/parsec/zsytrf_sp2d.jdf b/sopalin/parsec/zsytrf_sp2d.jdf
+index d0fca84..be14e8c 100644
+--- a/sopalin/parsec/zsytrf_sp2d.jdf
++++ b/sopalin/parsec/zsytrf_sp2d.jdf
+@@ -406,9 +406,9 @@ RW    C   <-  isTwoD & noskip & (first == last) ? A OneToTwoD( k, m )
+ /*            gpublok_ztrsmsp( PastixLCoef, PastixRight, PastixUpper, */
+ /*                             PastixNoTrans, PastixNonUnit, */
+ /*                             cblk, m, A, C, &lowrank, */
+-/*                             parsec_body.stream, cublas_handle );*/
++/*                             parsec_body.stream, cublas_handle + parsec_body.index );*/
+ /*                             */
+-/*            gpublok_zscalo( PastixTrans, cblk, m, C, A, WS, parsec_body.stream, cublas_handle  );*/
++/*            gpublok_zscalo( PastixTrans, cblk, m, C, A, WS, parsec_body.stream, cublas_handle + parsec_body.index  );*/
+ /*        }*/
+ /*    }*/
+ /*}*/
+@@ -621,7 +621,7 @@ BODY [ type=CUDA
+             gpublok_zgemmsp( PastixLCoef, PastixUCoef, PastixTrans,
+                              cblk, fcblk, blok_mk, nk, blok_mn,
+                              A, B, C, &lowrank,
+-                             parsec_body.stream, cublas_handle );
++                             parsec_body.stream, cublas_handle + parsec_body.index );
+         }
+         
+ 		counter++;
+-- 
+2.43.0
+

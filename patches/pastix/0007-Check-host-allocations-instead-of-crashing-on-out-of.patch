@@ -1,0 +1,334 @@
+From 8fca241f1d4f79030803c1438f1b7184258e710c Mon Sep 17 00:00:00 2001
+From: tj-barrett <barrett.t@northeastern.edu>
+Date: Thu, 15 Oct 2026 21:43:28 -0400
+Subject: [PATCH] Check host allocations instead of crashing on out-of-memory
+
+malloc/calloc/realloc results were never checked, and neither were the cudaMallocHost
+(pinned) allocations of the L and U factors in MALLOC_HOST nor the cudaMalloc of the
+block table. When a factorization did not fit in memory, PaStiX segfaulted later from
+many threads at once (e.g. a 1.26M-equation problem in FP64 needs ~56 GB for L+U).
+
+common/pastix_alloc_check.h routes malloc/calloc/realloc to checked wrappers that print
+the failed size and location and exit; it is force-included in every C file of the
+library, which also covers the PaRSEC task code generated from the .jdf files.
+MALLOC_HOST and the block-table cudaMalloc check their CUDA status. Calls through the
+refinement solver's malloc function pointer are written (solver.malloc)(n) so that the
+function-like macro does not apply to them.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CMakeLists.txt                        |  4 ++
+ common/memory.h                       |  9 +++-
+ common/pastix_alloc_check.h           | 68 +++++++++++++++++++++++++++
+ refinement/z_refine_bicgstab.c        | 20 ++++----
+ refinement/z_refine_gmres.c           | 20 ++++----
+ refinement/z_refine_gmres_gpu.c       | 24 +++++-----
+ refinement/z_refine_grad.c            |  8 ++--
+ refinement/z_refine_pivot.c           |  4 +-
+ sopalin/parsec/parsec_sparse_matrix.c |  5 +-
+ 9 files changed, 120 insertions(+), 42 deletions(-)
+ create mode 100644 common/pastix_alloc_check.h
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index cd2ee9b..bedbf50 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -11,6 +11,10 @@
+ cmake_minimum_required (VERSION 2.8)
+ project (PASTIX C CXX Fortran)
+ 
++# Turn failed host allocations into an error message instead of a later segfault
++# (also covers the PaRSEC task code generated from the .jdf files)
++add_compile_options("SHELL:$<$<COMPILE_LANGUAGE:C>:-include ${CMAKE_CURRENT_SOURCE_DIR}/common/pastix_alloc_check.h>")
++
+ include(CMakeDependentOption)
+ include(CheckFunctionExists)
+ 
+diff --git a/common/memory.h b/common/memory.h
+index 19d36a6..7299fb0 100644
+--- a/common/memory.h
++++ b/common/memory.h
+@@ -36,6 +36,8 @@
+ #ifndef _memory_h_
+ #define _memory_h_
+ 
++#include "pastix_alloc_check.h"
++
+ /*
+  * Function: pastix_protected_malloc
+  *
+@@ -95,8 +97,11 @@ static inline void *pastix_malloc_func( size_t size,
+ #ifdef PASTIX_WITH_CUDA
+ #define MALLOC_HOST(ptr, size, type, gpu)                          \
+     do {                                                        \
+-		if(gpu)													\
+-			cudaMallocHost((void**)&ptr, (size) * sizeof(type)) ;          \
++		if(gpu) {												\
++			if( cudaMallocHost((void**)&ptr, (size) * sizeof(type)) != cudaSuccess ) \
++				pastix_alloc_failed( (size_t)((size) * sizeof(type)),  \
++				                     "cudaMallocHost", __FILE__, __LINE__ ); \
++		}														\
+ 		else            										\
+ 			ptr = (type*)memAlloc((size) * sizeof(type)) ;          \
+     } while(0)
+diff --git a/common/pastix_alloc_check.h b/common/pastix_alloc_check.h
+new file mode 100644
+index 0000000..81af636
+--- /dev/null
++++ b/common/pastix_alloc_check.h
+@@ -0,0 +1,68 @@
++/**
++ * @file pastix_alloc_check.h
++ *
++ * Checked host allocations.
++ *
++ * PaStiX (and the PaRSEC task code generated for it) did not check the result of
++ * malloc/calloc/realloc, so running out of memory -- typically while allocating
++ * the factors of a large matrix -- showed up as a segfault somewhere later. This
++ * header is force-included in every C file of the library (see CMakeLists.txt) and
++ * turns a failed allocation into an error message naming the size and location.
++ *
++ * A NULL result is only an error for a non-zero size: malloc(0) may legally
++ * return NULL. Calls through function pointers named malloc must be written
++ * (s.malloc)(n) to keep them out of the macro.
++ */
++#ifndef _pastix_alloc_check_h_
++#define _pastix_alloc_check_h_
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <stdint.h>
++
++static inline void
++pastix_alloc_failed( size_t size, const char *what, const char *file, int line )
++{
++    fprintf( stderr,
++             "\nPaStiX error: %s of %zu bytes (%.2f GB) failed at %s:%d\n"
++             "PaStiX error: not enough memory; the factorization needs more memory than is available\n",
++             what, size, (double)size / 1073741824., file, line );
++    exit( EXIT_FAILURE );
++}
++
++static inline void *
++pastix_checked_malloc( size_t size, const char *file, int line )
++{
++    void *ptr = malloc( size );
++    if ( (ptr == NULL) && (size > 0) ) {
++        pastix_alloc_failed( size, "malloc", file, line );
++    }
++    return ptr;
++}
++
++static inline void *
++pastix_checked_calloc( size_t nmemb, size_t size, const char *file, int line )
++{
++    void *ptr = calloc( nmemb, size );
++    if ( (ptr == NULL) && (nmemb > 0) && (size > 0) ) {
++        pastix_alloc_failed( (size > SIZE_MAX / nmemb) ? SIZE_MAX : nmemb * size,
++                             "calloc", file, line );
++    }
++    return ptr;
++}
++
++static inline void *
++pastix_checked_realloc( void *old, size_t size, const char *file, int line )
++{
++    void *ptr = realloc( old, size );
++    if ( (ptr == NULL) && (size > 0) ) {
++        pastix_alloc_failed( size, "realloc", file, line );
++    }
++    return ptr;
++}
++
++#define malloc( _size_ )           pastix_checked_malloc( (_size_), __FILE__, __LINE__ )
++#define calloc( _nmemb_, _size_ )  pastix_checked_calloc( (_nmemb_), (_size_), __FILE__, __LINE__ )
++#define realloc( _ptr_, _size_ )   pastix_checked_realloc( (_ptr_), (_size_), __FILE__, __LINE__ )
++
++#endif /* _pastix_alloc_check_h_ */
+diff --git a/refinement/z_refine_bicgstab.c b/refinement/z_refine_bicgstab.c
+index e504e2e..6e4a162 100644
+--- a/refinement/z_refine_bicgstab.c
++++ b/refinement/z_refine_bicgstab.c
+@@ -78,16 +78,16 @@ pastix_int_t z_bicgstab_smp (pastix_data_t *pastix_data, void *x, void *b)
+     itermax = pastix_data->iparm[IPARM_ITERMAX];
+     eps     = pastix_data->dparm[DPARM_EPSILON_REFINEMENT];
+ 
+-    gradr  = (pastix_complex64_t *)solver.malloc(n * sizeof(pastix_complex64_t));
+-    gradr2 = (pastix_complex64_t *)solver.malloc(n * sizeof(pastix_complex64_t));
+-    gradp  = (pastix_complex64_t *)solver.malloc(n * sizeof(pastix_complex64_t));
+-    grady  = (pastix_complex64_t *)solver.malloc(n * sizeof(pastix_complex64_t));
+-    gradv  = (pastix_complex64_t *)solver.malloc(n * sizeof(pastix_complex64_t));
+-    grads  = (pastix_complex64_t *)solver.malloc(n * sizeof(pastix_complex64_t));
+-    gradz  = (pastix_complex64_t *)solver.malloc(n * sizeof(pastix_complex64_t));
+-    gradt  = (pastix_complex64_t *)solver.malloc(n * sizeof(pastix_complex64_t));
+-    grad2  = (pastix_complex64_t *)solver.malloc(n * sizeof(pastix_complex64_t));
+-    grad3  = (pastix_complex64_t *)solver.malloc(n * sizeof(pastix_complex64_t));
++    gradr  = (pastix_complex64_t *)(solver.malloc)(n * sizeof(pastix_complex64_t));
++    gradr2 = (pastix_complex64_t *)(solver.malloc)(n * sizeof(pastix_complex64_t));
++    gradp  = (pastix_complex64_t *)(solver.malloc)(n * sizeof(pastix_complex64_t));
++    grady  = (pastix_complex64_t *)(solver.malloc)(n * sizeof(pastix_complex64_t));
++    gradv  = (pastix_complex64_t *)(solver.malloc)(n * sizeof(pastix_complex64_t));
++    grads  = (pastix_complex64_t *)(solver.malloc)(n * sizeof(pastix_complex64_t));
++    gradz  = (pastix_complex64_t *)(solver.malloc)(n * sizeof(pastix_complex64_t));
++    gradt  = (pastix_complex64_t *)(solver.malloc)(n * sizeof(pastix_complex64_t));
++    grad2  = (pastix_complex64_t *)(solver.malloc)(n * sizeof(pastix_complex64_t));
++    grad3  = (pastix_complex64_t *)(solver.malloc)(n * sizeof(pastix_complex64_t));
+ 
+     clockInit(refine_clk);clockStart(refine_clk);
+ 
+diff --git a/refinement/z_refine_gmres.c b/refinement/z_refine_gmres.c
+index 86e0a4f..9409f09 100644
+--- a/refinement/z_refine_gmres.c
++++ b/refinement/z_refine_gmres.c
+@@ -89,9 +89,9 @@ pastix_int_t z_gmres_smp(pastix_data_t *pastix_data, void *x, void *b)
+         ldw = 0;
+     }
+ 
+-    gmcos = (pastix_complex64_t *)solver.malloc(im  * sizeof(pastix_complex64_t));
+-    gmsin = (pastix_complex64_t *)solver.malloc(im  * sizeof(pastix_complex64_t));
+-    gmG   = (pastix_complex64_t *)solver.malloc(im1 * sizeof(pastix_complex64_t));
++    gmcos = (pastix_complex64_t *)(solver.malloc)(im  * sizeof(pastix_complex64_t));
++    gmsin = (pastix_complex64_t *)(solver.malloc)(im  * sizeof(pastix_complex64_t));
++    gmG   = (pastix_complex64_t *)(solver.malloc)(im1 * sizeof(pastix_complex64_t));
+ 
+     /**
+      * H stores the h_{i,j} elements ot the upper hessenberg matrix H (See Alg. 9.5 p 270)
+@@ -103,20 +103,20 @@ pastix_int_t z_gmres_smp(pastix_data_t *pastix_data, void *x, void *b)
+      * stores only temporarily one vector for the Ax product (ldw is set to 0 to
+      * reuse the same vector at each iteration)
+      */
+-    gmH = (pastix_complex64_t *)solver.malloc(im * im1 * sizeof(pastix_complex64_t));
+-    gmV = (pastix_complex64_t *)solver.malloc(n  * im1 * sizeof(pastix_complex64_t));
++    gmH = (pastix_complex64_t *)(solver.malloc)(im * im1 * sizeof(pastix_complex64_t));
++    gmV = (pastix_complex64_t *)(solver.malloc)(n  * im1 * sizeof(pastix_complex64_t));
+     if (precond && (!savemem) ) {
+-        gmW = (pastix_complex64_t *)solver.malloc(n * im  * sizeof(pastix_complex64_t));
++        gmW = (pastix_complex64_t *)(solver.malloc)(n * im  * sizeof(pastix_complex64_t));
+     }
+     else {
+-        gmW = (pastix_complex64_t *)solver.malloc(n       * sizeof(pastix_complex64_t));
++        gmW = (pastix_complex64_t *)(solver.malloc)(n       * sizeof(pastix_complex64_t));
+     }
+     memset( gmH, 0, im * im1 * sizeof(pastix_complex64_t) );
+ 
+ #if defined(PASTIX_DEBUG_GMRES)
+-    dbg_x = (pastix_complex64_t *)solver.malloc(n   * sizeof(pastix_complex64_t));
+-    dbg_r = (pastix_complex64_t *)solver.malloc(n   * sizeof(pastix_complex64_t));
+-    dbg_G = (pastix_complex64_t *)solver.malloc(im1 * sizeof(pastix_complex64_t));
++    dbg_x = (pastix_complex64_t *)(solver.malloc)(n   * sizeof(pastix_complex64_t));
++    dbg_r = (pastix_complex64_t *)(solver.malloc)(n   * sizeof(pastix_complex64_t));
++    dbg_G = (pastix_complex64_t *)(solver.malloc)(im1 * sizeof(pastix_complex64_t));
+     solver.copy( pastix_data, n, x, dbg_x );
+ #endif
+ 
+diff --git a/refinement/z_refine_gmres_gpu.c b/refinement/z_refine_gmres_gpu.c
+index 863bf0e..fa54999 100644
+--- a/refinement/z_refine_gmres_gpu.c
++++ b/refinement/z_refine_gmres_gpu.c
+@@ -94,9 +94,9 @@ pastix_int_t z_gmres_gpu_smp(pastix_data_t *pastix_data, void *x, void *b)
+         ldw = 0;
+     }
+ 
+-    gmcos = (pastix_complex64_t *)solver.malloc(im  * sizeof(pastix_complex64_t));
+-    gmsin = (pastix_complex64_t *)solver.malloc(im  * sizeof(pastix_complex64_t));
+-    gmG   = (pastix_complex64_t *)solver.malloc(im1 * sizeof(pastix_complex64_t));
++    gmcos = (pastix_complex64_t *)(solver.malloc)(im  * sizeof(pastix_complex64_t));
++    gmsin = (pastix_complex64_t *)(solver.malloc)(im  * sizeof(pastix_complex64_t));
++    gmG   = (pastix_complex64_t *)(solver.malloc)(im1 * sizeof(pastix_complex64_t));
+ 
+     /**
+      * H stores the h_{i,j} elements ot the upper hessenberg matrix H (See Alg. 9.5 p 270)
+@@ -109,21 +109,21 @@ pastix_int_t z_gmres_gpu_smp(pastix_data_t *pastix_data, void *x, void *b)
+      * reuse the same vector at each iteration)
+      */
+      
+-    gmH = (pastix_complex64_t *)solver.malloc(im * im1 * sizeof(pastix_complex64_t));
+-    gmV = (pastix_complex64_t *)solver.malloc(n  * im1 * sizeof(pastix_complex64_t));
++    gmH = (pastix_complex64_t *)(solver.malloc)(im * im1 * sizeof(pastix_complex64_t));
++    gmV = (pastix_complex64_t *)(solver.malloc)(n  * im1 * sizeof(pastix_complex64_t));
+     if (precond && (!savemem) ) {
+-        gmW = (pastix_complex64_t *)solver.malloc(n * im  * sizeof(pastix_complex64_t));
++        gmW = (pastix_complex64_t *)(solver.malloc)(n * im  * sizeof(pastix_complex64_t));
+     }
+     else {
+-        gmW = (pastix_complex64_t *)solver.malloc(n       * sizeof(pastix_complex64_t));
++        gmW = (pastix_complex64_t *)(solver.malloc)(n       * sizeof(pastix_complex64_t));
+     }
+     if(pastix_data->iparm[IPARM_GPU_NBR] > 0){
+ #ifdef PASTIX_WITH_CUDA
+ 		gmWi_host = (pastix_complex64_t*) malloc(n * sizeof(pastix_complex64_t));
+ 		cudaMemset( gmH, 0, im * im1 * sizeof(pastix_complex64_t) );
+ 		
+-		d_x = (pastix_complex64_t *)solver.malloc(n * sizeof(pastix_complex64_t));
+-		d_b = (pastix_complex64_t *)solver.malloc(n * sizeof(pastix_complex64_t));
++		d_x = (pastix_complex64_t *)(solver.malloc)(n * sizeof(pastix_complex64_t));
++		d_b = (pastix_complex64_t *)(solver.malloc)(n * sizeof(pastix_complex64_t));
+ 		cudaMemcpy( d_x, x, n *  sizeof(pastix_complex64_t), cudaMemcpyHostToDevice);
+ 		cudaMemcpy( d_b, b, n *  sizeof(pastix_complex64_t), cudaMemcpyHostToDevice);
+ 		tmp_ptr = b; b = d_b; d_b = tmp_ptr;
+@@ -135,9 +135,9 @@ pastix_int_t z_gmres_gpu_smp(pastix_data_t *pastix_data, void *x, void *b)
+ 	}
+ 
+ #if defined(PASTIX_DEBUG_GMRES)
+-    dbg_x = (pastix_complex64_t *)solver.malloc(n   * sizeof(pastix_complex64_t));
+-    dbg_r = (pastix_complex64_t *)solver.malloc(n   * sizeof(pastix_complex64_t));
+-    dbg_G = (pastix_complex64_t *)solver.malloc(im1 * sizeof(pastix_complex64_t));
++    dbg_x = (pastix_complex64_t *)(solver.malloc)(n   * sizeof(pastix_complex64_t));
++    dbg_r = (pastix_complex64_t *)(solver.malloc)(n   * sizeof(pastix_complex64_t));
++    dbg_G = (pastix_complex64_t *)(solver.malloc)(im1 * sizeof(pastix_complex64_t));
+     solver.copy( pastix_data, n, x, dbg_x );
+ #endif
+ 
+diff --git a/refinement/z_refine_grad.c b/refinement/z_refine_grad.c
+index 060ec13..383fcab 100644
+--- a/refinement/z_refine_grad.c
++++ b/refinement/z_refine_grad.c
+@@ -73,10 +73,10 @@ pastix_int_t z_grad_smp(pastix_data_t *pastix_data, void *x, void *b)
+     eps     = pastix_data->dparm[DPARM_EPSILON_REFINEMENT];
+ 
+     /* Initialize vectors */
+-    gradr = (pastix_complex64_t *)solver.malloc(n * sizeof(pastix_complex64_t));
+-    gradp = (pastix_complex64_t *)solver.malloc(n * sizeof(pastix_complex64_t));
+-    gradz = (pastix_complex64_t *)solver.malloc(n * sizeof(pastix_complex64_t));
+-    grad2 = (pastix_complex64_t *)solver.malloc(n * sizeof(pastix_complex64_t));
++    gradr = (pastix_complex64_t *)(solver.malloc)(n * sizeof(pastix_complex64_t));
++    gradp = (pastix_complex64_t *)(solver.malloc)(n * sizeof(pastix_complex64_t));
++    gradz = (pastix_complex64_t *)(solver.malloc)(n * sizeof(pastix_complex64_t));
++    grad2 = (pastix_complex64_t *)(solver.malloc)(n * sizeof(pastix_complex64_t));
+ 
+     clockInit(refine_clk);
+     clockStart(refine_clk);
+diff --git a/refinement/z_refine_pivot.c b/refinement/z_refine_pivot.c
+index 719a147..dfe77d2 100644
+--- a/refinement/z_refine_pivot.c
++++ b/refinement/z_refine_pivot.c
+@@ -71,8 +71,8 @@ z_pivot_smp( pastix_data_t *pastix_data,
+     {
+         fprintf(stdout, OUT_ITERREFINE_PIVOT);
+     }
+-    r  = (pastix_complex64_t *)solver.malloc(n * sizeof(pastix_complex64_t));
+-    dx = (pastix_complex64_t *)solver.malloc(n * sizeof(pastix_complex64_t));
++    r  = (pastix_complex64_t *)(solver.malloc)(n * sizeof(pastix_complex64_t));
++    dx = (pastix_complex64_t *)(solver.malloc)(n * sizeof(pastix_complex64_t));
+ 
+     clockInit(refine_clk);
+     clockStart(refine_clk);
+diff --git a/sopalin/parsec/parsec_sparse_matrix.c b/sopalin/parsec/parsec_sparse_matrix.c
+index e0159a2..b50e575 100644
+--- a/sopalin/parsec/parsec_sparse_matrix.c
++++ b/sopalin/parsec/parsec_sparse_matrix.c
+@@ -458,8 +458,9 @@ parsec_sparse_matrix_init_fermi( parsec_sparse_matrix_desc_t *spmtx,
+         fprintf(stderr, "cuda index = %d\n", gpu_device->cuda_index );
+         cudaSetDevice( gpu_device->cuda_index );
+ 
+-        cudaMalloc( &(spmtx->d_blocktab[i]),
+-                    size );
++        if ( cudaMalloc( &(spmtx->d_blocktab[i]), size ) != cudaSuccess ) {
++            pastix_alloc_failed( size, "cudaMalloc", __FILE__, __LINE__ );
++        }
+ 
+         cudaMemcpy( spmtx->d_blocktab[i],
+                     bloktab, size,
+-- 
+2.43.0
+

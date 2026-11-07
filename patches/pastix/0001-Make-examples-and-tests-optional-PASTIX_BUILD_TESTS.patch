@@ -1,0 +1,32 @@
+From 128baea37086acc13ebd32a1a4d993f4225868f3 Mon Sep 17 00:00:00 2001
+From: tj-barrett <barrett.t@northeastern.edu>
+Date: Thu, 15 Oct 2026 21:21:34 -0400
+Subject: [PATCH 1/6] Make examples and tests optional (PASTIX_BUILD_TESTS)
+
+Their generated sources fail to configure with CMake >= 3.27; the library does not need them.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CMakeLists.txt | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index b6629a7..8653b21 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -880,9 +880,12 @@ install(FILES ${PASTIX_HDRS} DESTINATION include/pastix )
+ enable_testing()
+ include(CTest)
+ # Examples executables
++option(PASTIX_BUILD_TESTS "Build examples and tests" OFF)
++if(PASTIX_BUILD_TESTS)
+ add_subdirectory(example)
+ # Testing executables
+ add_subdirectory(test)
++endif()
+ 
+ ### Wrappers
+ add_subdirectory(wrappers)
+-- 
+2.43.0
+

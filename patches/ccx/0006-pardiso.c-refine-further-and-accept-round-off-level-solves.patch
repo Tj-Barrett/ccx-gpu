@@ -1,0 +1,104 @@
+From: tj-barrett <barrett.t@northeastern.edu>
+Subject: [PATCH] pardiso.c: refine further and accept round-off-level solves
+
+Patch 0003 stopped ccx (exit 201) whenever the PARDISO solve phase returned -4
+(iterative refinement did not converge) with a backward error >= 1e-10. With a
+UMAT, ccx runs a second Newton iteration even in a linear step; its right-hand
+side is round-off, it varies from run to run with the threaded assembly, and
+PARDISO's refinement can stall on it (observed backward errors 4e-8..5e-7 on a
+1.56M-equation semicrystalline RVE). The job then died at random load cases.
+
+On -4, run up to 20 further refinement steps with the residual computed from
+the assembled matrix and the existing factorization (stop when the backward
+error stops halving). Accept below 1e-10 as before; accept below 1e-6 with a
+note, leaving the decision to ccx's Newton residual check; stop otherwise.
+Verified: the failing deck converges (one extra Newton iteration) and its
+stiffness passes symmetry 2e-9 and support-reaction 2e-8 checks; solves that
+never hit -4 are byte-identical.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+--- a/ccx_2.23/src/pardiso.c
++++ b/ccx_2.23/src/pardiso.c
+@@ -52,10 +52,10 @@
+ /* normwise backward error |b-Ax|_inf / (|A|_inf |x|_inf + |b|_inf) of a solution,
+    from the CSR arrays handed to PARDISO (1-based; upper triangle for mtype=-2) */
+ static double pardiso_backward_error(ITG mtype, ITG n, const double *x,
+-                                     const double *b){
++                                     const double *b, double *rout){
+   ITG i,j,k;
+   double *r=NULL,*rowsum=NULL,a,rmax=0.,amax=0.,xmax=0.,bmax=0.;
+-  NNEW(r,double,n);
++  if(rout!=NULL){r=rout;}else{NNEW(r,double,n);}  /* rout: keep the residual */
+   NNEW(rowsum,double,n);
+   for(i=0;i<n;i++){r[i]=b[i];}
+   for(i=0;i<n;i++){
+@@ -76,7 +76,7 @@
+     if(fabs(x[i])>xmax) xmax=fabs(x[i]);
+     if(fabs(b[i])>bmax) bmax=fabs(b[i]);
+   }
+-  SFREE(r);
++  if(rout==NULL){SFREE(r);}
+   SFREE(rowsum);
+   return (amax*xmax+bmax>0.) ? rmax/(amax*xmax+bmax) : 0.;
+ }
+@@ -400,18 +400,50 @@
+ 		   pointers,icolpardiso,perm,nrhs,iparm,&msglvl,
+                    b,x,&error));
+   if(error==-4){
+-    /* -4 in the solve phase: iterative refinement did not reach PARDISO's own
+-       tolerance (typically for a tiny right-hand side, e.g. a Newton correction).
+-       Accept the solution if its backward error is small, otherwise stop. */
+-    ITG irhs;
+-    double berr,berrmax=0.;
++    /* -4 in the solve phase: PARDISO's iterative refinement did not reach its own
++       tolerance. Seen for right-hand sides that are round-off, e.g. the second
++       Newton iteration of a linear step with a UMAT (backward error ~1e-8..1e-7,
++       varying from run to run with the threaded assembly). Refine further here,
++       with the residual computed from the assembled matrix and the existing
++       factorization; accept below 1e-10, accept with a note below 1e-6 (ccx's
++       Newton residual check still applies), otherwise stop. */
++    ITG irhs,it,nit=0,phase_ir=33,err_ir;
++    double berr,berrold,berrmax=0.,berr0max=0.,*r=NULL,*d=NULL;
++    NNEW(r,double,*neq);
++    NNEW(d,double,*neq);
+     for(irhs=0;irhs<*nrhs;irhs++){
+-      berr=pardiso_backward_error(mtype,*neq,&x[irhs**neq],&b[irhs**neq]);
++      double *xi=&x[irhs**neq],*bi=&b[irhs**neq];
++      ITG one=1;
++      berr=pardiso_backward_error(mtype,*neq,xi,bi,r);
++      if(berr>berr0max) berr0max=berr;
++      for(it=0;it<20 && berr>=1.e-13;it++){
++        err_ir=0;
++        FORTRAN(pardiso,(pt,&maxfct,&mnum,&mtype,&phase_ir,neq,aupardiso,
++                         pointers,icolpardiso,perm,&one,iparm,&msglvl,
++                         r,d,&err_ir));
++        if(err_ir!=0 && err_ir!=-4) break;
++        for(i=0;i<*neq;i++){xi[i]+=d[i];}
++        berrold=berr;
++        berr=pardiso_backward_error(mtype,*neq,xi,bi,r);
++        nit++;
++        if(berr>0.5*berrold) break;        /* stagnated */
++      }
+       if(berr>berrmax) berrmax=berr;
+     }
+-    printf(" pardiso: iterative refinement did not converge, backward error %e\n",
+-           berrmax);
+-    if(berrmax<1.e-10) error=0;
++    SFREE(r);
++    SFREE(d);
++    printf(" pardiso: iterative refinement did not converge (backward error %e);\n"
++           "          %" ITGFORMAT " more refinement steps: backward error %e\n",
++           berr0max,nit,berrmax);
++    if(berrmax<1.e-10){
++      error=0;
++    }else if(berrmax<1.e-6){
++      /* typically the second Newton iteration of a (nearly) linear step: its
++         right-hand side is round-off, and so is the correction. ccx's force
++         residual check decides whether the increment has converged. */
++      printf(" pardiso: solution accepted, the Newton residual check decides convergence\n");
++      error=0;
++    }
+   }
+   pardiso_check("solve",error);
+   if(iparm[13]>0){

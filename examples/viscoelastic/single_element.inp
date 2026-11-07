@@ -1,0 +1,40 @@
+** Uniaxial stress relaxation of one C3D8 cube: ramp to 1% strain in 1 s, hold 40 s
+*Node
+1, 0., 0., 0.
+2, 1., 0., 0.
+3, 1., 1., 0.
+4, 0., 1., 0.
+5, 0., 0., 1.
+6, 1., 0., 1.
+7, 1., 1., 1.
+8, 0., 1., 1.
+*Element, type=C3D8, elset=EALL
+1, 1, 2, 3, 4, 5, 6, 7, 8
+*Nset, nset=X0
+1, 4, 5, 8
+*Nset, nset=Y0
+1, 2, 5, 6
+*Nset, nset=Z0
+1, 2, 3, 4
+*Nset, nset=TOP
+5, 6, 7, 8
+*Include, input=visco_material.inc
+*Solid Section, elset=EALL, material=ABAQUS_VISCO
+*Boundary
+X0, 1, 1
+Y0, 2, 2
+Z0, 3, 3
+*Step
+*Static, direct
+0.1, 1.0
+*Boundary
+TOP, 3, 3, 0.01
+*Node Print, nset=TOP, totals=only
+RF
+*End Step
+*Step
+*Static, direct
+2., 40.
+*Node Print, nset=TOP, totals=only
+RF
+*End Step

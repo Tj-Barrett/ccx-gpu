@@ -1,0 +1,35 @@
+From: tj-barrett <barrett.t@northeastern.edu>
+Subject: [PATCH] pastix.c: accept a stalled refinement with a small residual
+
+PaStiX factorizes with static pivoting (small pivots are perturbed, not
+exchanged). For RVEs with beam fibers and *EQUATION constraints the
+factorization can be a mediocre preconditioner: GMRES then stalls slightly
+above ccx's hard 1e-12 target (observed: 2.4e-11 after 50 iterations, on a
+fresh double-precision factorization) and ccx exited with status 5 after also
+retrying without diagonal scaling.
+
+Accept such a solution when the relative residual reported by PaStiX
+(DPARM_RELATIVE_ERROR) is below 1e-9 -- still orders of magnitude tighter than
+the Newton tolerance -- and print a note.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+--- a/ccx_2.23/src/pastix.c
++++ b/ccx_2.23/src/pastix.c
+@@ -916,6 +916,16 @@
+ 	SFREE(b);
+     b = NULL;
+ 
++    // GMRES can stall just above its 1e-12 target when the (statically pivoted)
++    // factorization is a poor preconditioner; such a solution is still far more
++    // accurate than ccx's Newton tolerance, so accept it below 1e-9
++    if( rc == -1 && pdparm[DPARM_RELATIVE_ERROR] >= 0. &&
++        pdparm[DPARM_RELATIVE_ERROR] < 1e-9 ){
++        printf("PaStiX: refinement stalled at relative residual %e, solution accepted\n",
++               pdparm[DPARM_RELATIVE_ERROR]);
++        rc = 0;
++    }
++
+     modePrev = mode;
+     if( !rc ) firstIter = 0;
+     if( rc == -1 && globDoublePrecision && !noScale ){

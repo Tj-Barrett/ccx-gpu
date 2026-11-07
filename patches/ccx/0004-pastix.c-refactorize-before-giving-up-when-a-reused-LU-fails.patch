@@ -1,0 +1,47 @@
+From: tj-barrett <barrett.t@northeastern.edu>
+Subject: [PATCH] pastix.c: refactorize before giving up when a reused LU fails
+
+Between Newton iterations ccx's PaStiX interface reuses the LU factorization of an
+earlier matrix as a preconditioner for GMRES (IPARM_REUSE_LU). If GMRES does not
+converge in double precision with diagonal scaling already off, ccx exited with
+status 5 -- without ever factorizing the current matrix. With a viscoelastic UMAT
+(30 increments, ~100 solves) GMRES regularly needed its full 70 iterations, and a
+run on two GPUs (different task scheduling) stopped at 3.8e-12 against the 1e-12
+target and exited.
+
+Record whether the current call factorized the matrix or reused an earlier LU, and
+in the latter case refactorize and solve again before giving up.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+--- a/ccx_2.23/src/pastix.c
++++ b/ccx_2.23/src/pastix.c
+@@ -1094,6 +1094,10 @@
+         }
+     }
+ 
++	// remember whether this call factorizes the current matrix or reuses an
++	// earlier factorization (IPARM_REUSE_LU) as a preconditioner for GMRES
++	char freshFactor = forceRedo;
++
+ 	//invoke init
+ 	pastix_init(ad,au,adb,aub,sigma,icol,irow, 
+ 		 neq,nzs,symmetryflag,inputformat,jq,nzs3);
+@@ -1114,6 +1118,17 @@
+ 		
+ 		// Give up, if we tried it with double precision, use backup b otherwise
+ 		if(globDoublePrecision == 1 && noScale ){
++            if( !freshFactor ){
++                // The factorization was reused from an earlier matrix and is too
++                // poor a preconditioner for this one: factorize the current matrix
++                // before giving up (previously ccx exited here)
++                memcpy(b, b_backup, sizeof(double) * (*nrhs)*(*neq));
++                printf("refactorizing: the reused factorization did not converge\n");
++                forceRedo = 1;
++                pastix_main_generic(ad, au, adb, aub, sigma, b, icol, irow, neq, nzs, symmetryflag, inputformat, jq, nzs3, nrhs);
++                SFREE(b_backup);
++                return;
++            }
+             printf("PaStiX could not converge to a valid result\n");
+             exit(5);
+         }

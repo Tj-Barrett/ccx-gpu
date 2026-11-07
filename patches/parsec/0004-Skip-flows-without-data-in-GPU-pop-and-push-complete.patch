@@ -1,0 +1,37 @@
+From 243015e3f93e32861ff5c8aaec1424c137bc2014 Mon Sep 17 00:00:00 2001
+From: tj-barrett <barrett.t@northeastern.edu>
+Date: Thu, 15 Oct 2026 21:21:34 -0400
+Subject: [PATCH 4/4] Skip flows without data in GPU pop and push-complete
+
+kernel_push already skips flows whose data_in is NULL (conditional flows such as
+PaStiX's GEMM2D A <- NULL), but kernel_pop and callback_complete_push dereferenced
+data_out unconditionally and segfaulted once PaStiX's pushout hints were honoured.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ parsec/devices/cuda/dev_cuda.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/parsec/devices/cuda/dev_cuda.c b/parsec/devices/cuda/dev_cuda.c
+index 86d0a1d78..6919b84a6 100644
+--- a/parsec/devices/cuda/dev_cuda.c
++++ b/parsec/devices/cuda/dev_cuda.c
+@@ -1565,6 +1565,7 @@ parsec_gpu_callback_complete_push(gpu_device_t              *gpu_device,
+         assert( flow );
+         assert( flow->flow_index == i );
+         if(!flow->flow_flags) continue;
++        if(NULL == task->data[i].data_out) continue;  /* conditional flow carrying no data for this task */
+         if(task->data[i].data_out->push_task == task ) {   /* only the task who did this PUSH can modify the status */
+             task->data[i].data_out->data_transfer_status = DATA_STATUS_COMPLETE_TRANSFER;
+             task->data[i].data_out->push_task = NULL;
+@@ -1882,6 +1883,7 @@ parsec_gpu_kernel_pop( gpu_device_t            *gpu_device,
+         if( 0 == flow->flow_flags )  continue;  /* control flow */
+ 
+         gpu_copy = this_task->data[i].data_out;
++        if( NULL == gpu_copy ) continue;  /* no data on this flow; skipped by kernel_push too */
+         original = gpu_copy->original;
+         assert(original == this_task->data[i].data_in->original);
+ 
+-- 
+2.43.0
+

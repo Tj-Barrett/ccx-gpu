@@ -1,0 +1,37 @@
+From: tj-barrett <barrett.t@northeastern.edu>
+Subject: [PATCH] pastix.c: select the ordering with PASTIX_ORDERING
+
+ccx hardcodes Scotch nested dissection for PaStiX. On large tetrahedral
+meshes METIS orders with much less fill: the 2.9M-equation periodic box of the
+semicrystal RVE has 5.8e9 nonzeros in L with Scotch (46 GB LU in mixed
+precision), against 2.2e9 for a METIS ordering of the same pattern.
+
+PASTIX_ORDERING=metis (or METIS) selects PastixOrderMetis; unset or anything
+else keeps Scotch, so existing runs are unchanged. PaStiX must be built with
+PASTIX_ORDERING_METIS (and a METIS whose idx_t matches pastix_int_t). The
+ordering in use is printed once.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+--- a/ccx_2.23/src/pastix.c
++++ b/ccx_2.23/src/pastix.c
+@@ -242,6 +242,19 @@
+ 	
+ 	// Set best PaStiX parameters for CalculiX usage
+     piparm[IPARM_ORDERING]  				= PastixOrderScotch;
++    {
++        /* PASTIX_ORDERING=metis selects METIS nested dissection (PaStiX built
++           with PASTIX_ORDERING_METIS); default and anything else: Scotch */
++        const char* pastix_ordering = getenv("PASTIX_ORDERING");
++        static int ordering_noted = 0;
++        if( pastix_ordering && (strcmp(pastix_ordering, "metis") == 0 || strcmp(pastix_ordering, "METIS") == 0) ){
++            piparm[IPARM_ORDERING] = PastixOrderMetis;
++        }
++        if( !ordering_noted ){
++            printf(" PaStiX ordering: %s\n", piparm[IPARM_ORDERING] == PastixOrderMetis ? "METIS" : "Scotch");
++            ordering_noted = 1;
++        }
++    }
+     if( mode == AS || mode == CP ){
+         piparm[IPARM_SCHEDULER] 			= PastixSchedStatic;
+     }

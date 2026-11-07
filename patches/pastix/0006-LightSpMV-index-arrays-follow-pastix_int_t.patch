@@ -1,0 +1,237 @@
+From 224b3f9172311a7b08eca097b55115e56643886e Mon Sep 17 00:00:00 2001
+From: tj-barrett <barrett.t@northeastern.edu>
+Date: Thu, 15 Oct 2026 21:21:35 -0400
+Subject: [PATCH 6/6] LightSpMV: index arrays follow pastix_int_t
+
+LightSpMV hard-coded int64_t row/column index arrays, but PaStiX passes its own
+pastix_int_t arrays, so a PASTIX_INT64=OFF build fed 32-bit indices to 64-bit kernels
+(wrong SpMV in GMRES refinement). Add lspmv_idx_t, 32-bit when PASTIX_INT64=OFF.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CMakeLists.txt                               |  5 +++++
+ kernels/gpus/LightSpMV-1.0/src/Options.h     |  4 ++--
+ kernels/gpus/LightSpMV-1.0/src/SpMV.h        |  8 ++++----
+ kernels/gpus/LightSpMV-1.0/src/SpMVCSR.h     | 16 ++++++++--------
+ kernels/gpus/LightSpMV-1.0/src/Types.h       |  1 +
+ kernels/gpus/LightSpMV-1.0/src/cLightSpMV.cu |  6 +++---
+ kernels/gpus/LightSpMV-1.0/src/cLightSpMV.h  |  8 +++++---
+ kernels/gpus/LightSpMV-1.0/src/lspmv_idx.h   | 11 +++++++++++
+ 8 files changed, 39 insertions(+), 20 deletions(-)
+ create mode 100644 kernels/gpus/LightSpMV-1.0/src/lspmv_idx.h
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 24fb9e5..cd2ee9b 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -282,6 +282,11 @@ if( PASTIX_WITH_CUDA )
+         set(CMAKE_REQUIRED_LIBRARIES "${saved_libs}")
+         set(PASTIX_CUDA_ARCH "86" CACHE STRING "GPU compute capability for CUDA kernels (e.g. 86 for RTX 30xx)")
+         list(APPEND CUDA_NVCC_FLAGS -O3 -arch=sm_${PASTIX_CUDA_ARCH} -w )
++        # LightSpMV receives pastix_int_t index arrays straight from PaStiX
++        if(NOT PASTIX_INT64)
++            add_definitions(-DLSPMV_IDX32)
++            list(APPEND CUDA_NVCC_FLAGS -DLSPMV_IDX32)
++        endif()
+         
+ 		set(CUDA_SEPARABLE_COMPILATION ON)
+ 
+diff --git a/kernels/gpus/LightSpMV-1.0/src/Options.h b/kernels/gpus/LightSpMV-1.0/src/Options.h
+index 2e107c3..c3ee058 100644
+--- a/kernels/gpus/LightSpMV-1.0/src/Options.h
++++ b/kernels/gpus/LightSpMV-1.0/src/Options.h
+@@ -94,9 +94,9 @@ struct Options {
+ 	/*matrix data*/
+ 	int64_t _numRows;
+ 	int64_t _numCols;
+-	int64_t *_rowOffsets;
++	lspmv_idx_t *_rowOffsets;
+ 	int64_t _numValues;
+-	int64_t *_colIndexValues;
++	lspmv_idx_t *_colIndexValues;
+ 	void *_numericalValues;
+ 
+ 	/*vector data*/
+diff --git a/kernels/gpus/LightSpMV-1.0/src/SpMV.h b/kernels/gpus/LightSpMV-1.0/src/SpMV.h
+index 6752a10..f4c5d2f 100644
+--- a/kernels/gpus/LightSpMV-1.0/src/SpMV.h
++++ b/kernels/gpus/LightSpMV-1.0/src/SpMV.h
+@@ -83,8 +83,8 @@ public:
+ 	/*y = alpha * Ax + beta * y*/
+ 	virtual void invokeKernelBLAS(const int64_t i);
+ 
+-	vector<int64_t*> _rowOffsets;
+-	vector<int64_t*> _colIndexValues;
++	vector<lspmv_idx_t*> _rowOffsets;
++	vector<lspmv_idx_t*> _colIndexValues;
+ 	vector<float*> _numericalValues;
+ 	vector<float*> _vectorY;
+ 	vector<float*> _vectorX;
+@@ -120,8 +120,8 @@ public:
+ 	/*y = alpha * Ax + beta * y*/
+ 	virtual void invokeKernelBLAS(const int64_t i);
+ 
+-	vector<int64_t*> _rowOffsets;
+-	vector<int64_t*> _colIndexValues;
++	vector<lspmv_idx_t*> _rowOffsets;
++	vector<lspmv_idx_t*> _colIndexValues;
+ 	vector<double*> _numericalValues;
+ 	vector<double*> _vectorY;
+ 	vector<double*> _vectorX;
+diff --git a/kernels/gpus/LightSpMV-1.0/src/SpMVCSR.h b/kernels/gpus/LightSpMV-1.0/src/SpMVCSR.h
+index bbd245d..9d9d860 100644
+--- a/kernels/gpus/LightSpMV-1.0/src/SpMVCSR.h
++++ b/kernels/gpus/LightSpMV-1.0/src/SpMVCSR.h
+@@ -66,7 +66,7 @@ __device__ inline double DOUBLE_VECTOR_GET (const double* __restrict vectorX, in
+ /*32-bit*/
+ template < typename T, int64_t THREADS_PER_VECTOR, int64_t MAX_NUM_VECTORS_PER_BLOCK>
+ 
+-	__global__ void csr32DynamicWarp(unsigned long long* __restrict cudaRowCounter, const int64_t* __restrict rowOffsets, const int64_t* __restrict colIndexValues,
++	__global__ void csr32DynamicWarp(unsigned long long* __restrict cudaRowCounter, const lspmv_idx_t* __restrict rowOffsets, const lspmv_idx_t* __restrict colIndexValues,
+ 			const T* __restrict numericalValues, const T* __restrict vectorX, T* vectorY) {
+ 
+ 	int64_t i;
+@@ -147,7 +147,7 @@ template < typename T, int64_t THREADS_PER_VECTOR, int64_t MAX_NUM_VECTORS_PER_B
+ /*vector-based row dynamic distribution*/
+ template < typename T, int64_t THREADS_PER_VECTOR, int64_t MAX_NUM_VECTORS_PER_BLOCK>
+ 
+-	__global__ void csr32DynamicVector(unsigned long long* __restrict cudaRowCounter, const int64_t* __restrict rowOffsets, const int64_t* __restrict colIndexValues,
++	__global__ void csr32DynamicVector(unsigned long long* __restrict cudaRowCounter, const lspmv_idx_t* __restrict rowOffsets, const lspmv_idx_t* __restrict colIndexValues,
+ 			const T* __restrict numericalValues, const T* __restrict vectorX, T* vectorY) {
+ 
+ 
+@@ -221,7 +221,7 @@ template < typename T, int64_t THREADS_PER_VECTOR, int64_t MAX_NUM_VECTORS_PER_B
+ 	/*32-bit*/
+ 	template < typename T, int64_t THREADS_PER_VECTOR, int64_t MAX_NUM_VECTORS_PER_BLOCK>
+ 
+-		__global__ void csr32DynamicWarpBLAS(unsigned long long* __restrict cudaRowCounter, const int64_t* __restrict rowOffsets, const int64_t* __restrict colIndexValues,
++		__global__ void csr32DynamicWarpBLAS(unsigned long long* __restrict cudaRowCounter, const lspmv_idx_t* __restrict rowOffsets, const lspmv_idx_t* __restrict colIndexValues,
+ 				const T* __restrict numericalValues, const T* __restrict vectorX, T* vectorY, const T alpha, const T beta) {
+ 
+ 		int64_t i;
+@@ -303,7 +303,7 @@ template < typename T, int64_t THREADS_PER_VECTOR, int64_t MAX_NUM_VECTORS_PER_B
+ 	/*vector-based row dynamic distribution*/
+ 	template < typename T, int64_t THREADS_PER_VECTOR, int64_t MAX_NUM_VECTORS_PER_BLOCK>
+ 
+-		__global__ void csr32DynamicVectorBLAS(unsigned long long* __restrict cudaRowCounter, const int64_t* __restrict rowOffsets, const int64_t* __restrict colIndexValues,
++		__global__ void csr32DynamicVectorBLAS(unsigned long long* __restrict cudaRowCounter, const lspmv_idx_t* __restrict rowOffsets, const lspmv_idx_t* __restrict colIndexValues,
+ 				const T* __restrict numericalValues, const T* __restrict vectorX, T* vectorY, const T alpha, const T beta) {
+ 
+ 
+@@ -378,7 +378,7 @@ template < typename T, int64_t THREADS_PER_VECTOR, int64_t MAX_NUM_VECTORS_PER_B
+ /*64-bit functions*/
+ template < typename T, int64_t THREADS_PER_VECTOR, int64_t MAX_NUM_VECTORS_PER_BLOCK>
+ 
+-__global__ void csr64DynamicVector(unsigned long long* __restrict cudaRowCounter, const int64_t* __restrict rowOffsets, const int64_t* __restrict colIndexValues,
++__global__ void csr64DynamicVector(unsigned long long* __restrict cudaRowCounter, const lspmv_idx_t* __restrict rowOffsets, const lspmv_idx_t* __restrict colIndexValues,
+ 		const T* __restrict numericalValues, const T* __restrict vectorX, T* vectorY)
+ 
+ {
+@@ -452,7 +452,7 @@ __global__ void csr64DynamicVector(unsigned long long* __restrict cudaRowCounter
+ 
+ template < typename T, int64_t THREADS_PER_VECTOR, int64_t MAX_NUM_VECTORS_PER_BLOCK>
+ 
+-__global__ void csr64DynamicWarp(unsigned long long* __restrict cudaRowCounter, const int64_t* __restrict rowOffsets, const int64_t* __restrict colIndexValues,
++__global__ void csr64DynamicWarp(unsigned long long* __restrict cudaRowCounter, const lspmv_idx_t* __restrict rowOffsets, const lspmv_idx_t* __restrict colIndexValues,
+ 		const T* __restrict numericalValues, const T* __restrict vectorX, T* vectorY)
+ 
+ {
+@@ -535,7 +535,7 @@ __global__ void csr64DynamicWarp(unsigned long long* __restrict cudaRowCounter,
+ /*64-bit functions*/
+ template < typename T, int64_t THREADS_PER_VECTOR, int64_t MAX_NUM_VECTORS_PER_BLOCK>
+ 
+-__global__ void csr64DynamicVectorBLAS(unsigned long long* __restrict cudaRowCounter, const int64_t* __restrict rowOffsets, const int64_t* __restrict colIndexValues,
++__global__ void csr64DynamicVectorBLAS(unsigned long long* __restrict cudaRowCounter, const lspmv_idx_t* __restrict rowOffsets, const lspmv_idx_t* __restrict colIndexValues,
+ 		const T* __restrict numericalValues, const T* __restrict vectorX, const T* __restrict inVectorY, T* vectorY, const T alpha, const T beta)
+ 
+ {
+@@ -610,7 +610,7 @@ __global__ void csr64DynamicVectorBLAS(unsigned long long* __restrict cudaRowCou
+ 
+ template < typename T, int64_t THREADS_PER_VECTOR, int64_t MAX_NUM_VECTORS_PER_BLOCK>
+ 
+-__global__ void csr64DynamicWarpBLAS(unsigned long long* __restrict cudaRowCounter, const int64_t* __restrict rowOffsets, const int64_t* __restrict colIndexValues,
++__global__ void csr64DynamicWarpBLAS(unsigned long long* __restrict cudaRowCounter, const lspmv_idx_t* __restrict rowOffsets, const lspmv_idx_t* __restrict colIndexValues,
+ 		const T* __restrict numericalValues, const T* __restrict vectorX, const T* __restrict inVectorY, T* vectorY, const T alpha, const T beta)
+ 
+ {
+diff --git a/kernels/gpus/LightSpMV-1.0/src/Types.h b/kernels/gpus/LightSpMV-1.0/src/Types.h
+index dfcef0d..9bd7b8c 100644
+--- a/kernels/gpus/LightSpMV-1.0/src/Types.h
++++ b/kernels/gpus/LightSpMV-1.0/src/Types.h
+@@ -9,6 +9,7 @@
+ #define TYPESSPMV_H_
+ 
+ #include <cuda.h>
++#include "lspmv_idx.h"
+ #include <vector>
+ #include <string.h>
+ //#include <iostream>
+diff --git a/kernels/gpus/LightSpMV-1.0/src/cLightSpMV.cu b/kernels/gpus/LightSpMV-1.0/src/cLightSpMV.cu
+index 4ecb4dc..c6483bd 100644
+--- a/kernels/gpus/LightSpMV-1.0/src/cLightSpMV.cu
++++ b/kernels/gpus/LightSpMV-1.0/src/cLightSpMV.cu
+@@ -40,7 +40,7 @@ void*  dBuffer    = NULL;
+ */
+ SpMVDoubleWarp* spmv;
+ 
+-EXTERNC void createLightSpMV(int64_t m, int64_t nnz, int64_t* drowptr, int64_t* dcolind, double* dvalues){ 
++EXTERNC void createLightSpMV(int64_t m, int64_t nnz, lspmv_idx_t* drowptr, lspmv_idx_t* dcolind, double* dvalues){ 
+ /*	glob_m = m;
+ 
+     // CUSPARSE APIs
+@@ -79,8 +79,8 @@ EXTERNC void createLightSpMV(int64_t m, int64_t nnz, int64_t* drowptr, int64_t*
+ EXTERNC void performLightLsMV(
+     double alpha,
+     double* dval,
+-    int64_t* drowptr,
+-    int64_t* dcolind,
++    lspmv_idx_t* drowptr,
++    lspmv_idx_t* dcolind,
+     double* dx,
+     double beta,
+     double* dy){
+diff --git a/kernels/gpus/LightSpMV-1.0/src/cLightSpMV.h b/kernels/gpus/LightSpMV-1.0/src/cLightSpMV.h
+index a5a7b3a..9a6aae3 100644
+--- a/kernels/gpus/LightSpMV-1.0/src/cLightSpMV.h
++++ b/kernels/gpus/LightSpMV-1.0/src/cLightSpMV.h
+@@ -1,15 +1,17 @@
++#include "lspmv_idx.h"
++
+ #ifdef __cplusplus
+ #define EXTERNC extern "C"
+ #else
+ #define EXTERNC
+ #endif
+ 
+-EXTERNC void createLightSpMV(int64_t m, int64_t nnz, int64_t* drowptr, int64_t* dcolind, double* dvalues);
++EXTERNC void createLightSpMV(int64_t m, int64_t nnz, lspmv_idx_t* drowptr, lspmv_idx_t* dcolind, double* dvalues);
+ EXTERNC void performLightLsMV(
+     double alpha,
+     double* dval,
+-    int64_t* drowptr,
+-    int64_t* dcolind,
++    lspmv_idx_t* drowptr,
++    lspmv_idx_t* dcolind,
+     double* dx,
+     double beta,
+     double* dy);
+diff --git a/kernels/gpus/LightSpMV-1.0/src/lspmv_idx.h b/kernels/gpus/LightSpMV-1.0/src/lspmv_idx.h
+new file mode 100644
+index 0000000..7528e90
+--- /dev/null
++++ b/kernels/gpus/LightSpMV-1.0/src/lspmv_idx.h
+@@ -0,0 +1,11 @@
++/* Index type of the CSR row-offset / column arrays handed in by PaStiX.
++ * Must match pastix_int_t: LSPMV_IDX32 is defined by CMake when PASTIX_INT64=OFF. */
++#ifndef LSPMV_IDX_H_
++#define LSPMV_IDX_H_
++#include <stdint.h>
++#ifdef LSPMV_IDX32
++typedef int32_t lspmv_idx_t;
++#else
++typedef int64_t lspmv_idx_t;
++#endif
++#endif
+-- 
+2.43.0
+

@@ -1,0 +1,112 @@
+From: tj-barrett <barrett.t@northeastern.edu>
+Subject: [PATCH] pastix.c: hand PaStiX index arrays of its own integer type
+
+pastix.c passed ccx's ITG (int) CSC arrays to PaStiX as spm_int_t*. That only works
+when PaStiX is built with 32-bit integers, and a 32-bit PaStiX overflows its factor
+offsets once L+U exceeds 2^31 entries (around 600k equations for C3D10 RVEs: the
+solver segfaults during analysis). The CalculiX instructions avoid this by building
+everything with 64-bit integers (Makefile_i8), which needs ILP64 SPOOLES/ARPACK/MKL.
+
+Instead, keep ITG=int and store only the CSC arrays handed to PaStiX (icolpastix,
+irowpastix) as spm_int_t, converting where they were filled with memcpy from ITG
+arrays. Works with both 32- and 64-bit PaStiX builds.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+--- a/ccx_2.23/src/pastix.c
++++ b/ccx_2.23/src/pastix.c
+@@ -57,8 +57,15 @@
+ char noScale=0;
+ 
+ // Current sparse matrix in CSC
++// The CSC index arrays are handed to PaStiX, so they use its integer type (spm_int_t),
++// which may be wider than ITG: a 64-bit PaStiX is needed once the factor exceeds 2^31 entries.
+ double *aupastix=NULL;
+-ITG *icolpastix=NULL,*irowpastix=NULL;
++spm_int_t *icolpastix=NULL,*irowpastix=NULL;
++
++static void copy_itg_to_spm(spm_int_t *dst, const ITG *src, ITG n){
++    ITG j;
++    for(j=0;j<n;j++) dst[j]=src[j];
++}
+ 
+ // Global variable that indicates whether we are currently reusing or not
+ char redo = 1;
+@@ -134,8 +141,8 @@
+     ITG basePrev;
+     ITG *offsetPrev;
+     double *aupastix;
+-    ITG *icolpastix;
+-    ITG *irowpastix;
++    spm_int_t *icolpastix;
++    spm_int_t *irowpastix;
+     char redo;
+     ITG nzsTotal;
+     ITG pastix_nnzBound;
+@@ -276,8 +283,8 @@
+     } else{
+ 	    spm->nnzexp = spm->gnnzexp = spm->gnnz = spm->nnz = nzsTotal * 2 + *neq;
+     }
+-	spm->colptr = (spm_int_t*) icolpastix;
+-	spm->rowptr = (spm_int_t*) irowpastix;
++	spm->colptr = icolpastix;
++	spm->rowptr = irowpastix;
+ 
+ 
+ 	// initialize pastix
+@@ -524,14 +531,14 @@
+                 if( irowpastix == spm->rowptr ) spm->rowptr = NULL;
+             }
+ 
+-  			NNEW(irowpastix,ITG,nzsTotal*2+*neq);
++  			NNEW(irowpastix,spm_int_t,nzsTotal*2+*neq);
+ 
+             if(icolpastix != NULL ){
+                 SFREE(icolpastix);
+                 if( icolpastix == spm->colptr ) spm->colptr = NULL;
+             }
+ 
+-   			NNEW(icolpastix,ITG,*neq+1);
++   			NNEW(icolpastix,spm_int_t,*neq+1);
+ 			
+ 			if(irowacc != NULL){
+ 				SFREE(irowacc);		
+@@ -593,7 +600,7 @@
+ 				ITG k_pastix = icolpastix[i] + irowacc[i];
+ 				ITG k = jqTotal[i] - 1;
+ 				irowpastix[k_pastix-1] = i+1;
+-				memcpy(irowpastix + k_pastix, irow + k, sizeof(ITG) * icol[i]);
++				copy_itg_to_spm(irowpastix + k_pastix, irow + k, icol[i]);
+ 			}
+ 			
+ 			#pragma omp parallel for private(j) shared(irowpastix)
+@@ -664,15 +671,15 @@
+                 if(irowpastix == spm->rowptr) spm->rowptr = NULL;
+             }
+ 
+-  			NNEW(irowpastix,ITG,nzsTotal+*neq);
++  			NNEW(irowpastix,spm_int_t,nzsTotal+*neq);
+ 
+             if(icolpastix != NULL ){
+                 SFREE(icolpastix);
+                 if(icolpastix == spm->colptr) spm->colptr = NULL;
+             }
+ 
+-   			NNEW(icolpastix,ITG,*neq+1);
+-            memcpy(icolpastix, jqTotal, sizeof(ITG) * (*neq+1));
++   			NNEW(icolpastix,spm_int_t,*neq+1);
++            copy_itg_to_spm(icolpastix, jqTotal, *neq+1);
+ 
+             if(offsetPrev != NULL ){
+                 SFREE(offsetPrev);
+@@ -692,8 +699,8 @@
+ 
+             if(redo){
+                 // copy irow column per column and add the additional diagonal entry
+-                memcpy(irowpastix + i + offsetSource + offsetPrev[i], irow + offsetSource,
+-                        sizeof(ITG) * entriesPerColumn);
++                copy_itg_to_spm(irowpastix + i + offsetSource + offsetPrev[i], irow + offsetSource,
++                        entriesPerColumn);
+                 irowpastix[i+jqTotal[i+1]-jqTotal[0]+offsetPrev[i]] = i+1;
+             }
+         

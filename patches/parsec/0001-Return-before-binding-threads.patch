@@ -1,0 +1,27 @@
+From d71eea5ec3d65575508708e25882595a5636800f Mon Sep 17 00:00:00 2001
+From: tj-barrett <barrett.t@northeastern.edu>
+Date: Thu, 15 Oct 2026 21:21:34 -0400
+Subject: [PATCH 1/4] Return before binding threads
+
+Skip thread binding, as done by CalculiX's make_parsec.sh (avoids binding failures).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ parsec/bindthread.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/parsec/bindthread.c b/parsec/bindthread.c
+index c5e13dc1b..220b3afa8 100644
+--- a/parsec/bindthread.c
++++ b/parsec/bindthread.c
+@@ -33,6 +33,7 @@ extern kern_return_t thread_policy_set( thread_t               thread,
+ 
+ int parsec_bindthread(int cpu, int ht)
+ {
++return cpu;
+     if( -1 == cpu )  /* Don't try binding if not required */
+         return -1;
+ #ifdef MARCEL
+-- 
+2.43.0
+

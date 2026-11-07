@@ -1,0 +1,30 @@
+From f09f0ca5e285482988ca5b3964676e4768ba5a17 Mon Sep 17 00:00:00 2001
+From: tj-barrett <barrett.t@northeastern.edu>
+Date: Thu, 15 Oct 2026 21:21:35 -0400
+Subject: [PATCH 4/6] Make the CUDA architecture configurable
+ (PASTIX_CUDA_ARCH)
+
+The kernels were hard-wired to sm_35, which CUDA 12 no longer supports. Default 86.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CMakeLists.txt | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 8653b21..24fb9e5 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -280,7 +280,8 @@ if( PASTIX_WITH_CUDA )
+         endif()
+         set(CMAKE_REQUIRED_INCLUDES  "${saved_include}")
+         set(CMAKE_REQUIRED_LIBRARIES "${saved_libs}")
+-        list(APPEND CUDA_NVCC_FLAGS -O3 -arch=sm_35 -lcusparse -w )
++        set(PASTIX_CUDA_ARCH "86" CACHE STRING "GPU compute capability for CUDA kernels (e.g. 86 for RTX 30xx)")
++        list(APPEND CUDA_NVCC_FLAGS -O3 -arch=sm_${PASTIX_CUDA_ARCH} -w )
+         
+ 		set(CUDA_SEPARABLE_COMPILATION ON)
+ 
+-- 
+2.43.0
+

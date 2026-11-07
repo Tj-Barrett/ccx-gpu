@@ -1,0 +1,306 @@
+From c4c223a82eb3ff23d678d212793a059c814cec4f Mon Sep 17 00:00:00 2001
+From: tj-barrett <barrett.t@northeastern.edu>
+Date: Thu, 15 Oct 2026 21:21:35 -0400
+Subject: [PATCH 5/6] LightSpMV: port to *_sync warp intrinsics
+
+__shfl/__shfl_down no longer exist for sm_70+. A blanket full mask would be wrong:
+the shuffles sit in row loops that lanes leave at different times. Width-limited shuffles
+use the lane mask of the vector (whose lanes share a row); warp-wide row broadcasts in the
+loop use the mask of vectors whose row is still in range. A __syncwarp is added after the
+lane 0/1 writes to shared memory, which relied on pre-Volta lockstep execution.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ kernels/gpus/LightSpMV-1.0/src/SpMVCSR.h | 69 ++++++++++++++++--------
+ 1 file changed, 47 insertions(+), 22 deletions(-)
+
+diff --git a/kernels/gpus/LightSpMV-1.0/src/SpMVCSR.h b/kernels/gpus/LightSpMV-1.0/src/SpMVCSR.h
+index 27a9ca9..bbd245d 100644
+--- a/kernels/gpus/LightSpMV-1.0/src/SpMVCSR.h
++++ b/kernels/gpus/LightSpMV-1.0/src/SpMVCSR.h
+@@ -16,6 +16,19 @@ extern __constant__ int64_t _cudaNumCols;
+ 
+ namespace spmv_csr {
+ 
++/* Volta+ (independent thread scheduling) port: the legacy __shfl* intrinsics are
++ * gone, so every shuffle names the lanes taking part explicitly. */
++#define LSPMV_FULL_MASK 0xffffffffu
++/* lanes of the W-wide vector containing this thread (all lanes of a vector share a row) */
++#define LSPMV_VEC_MASK(W) ((W) >= 32 ? LSPMV_FULL_MASK : \
++	((((1u << (W)) - 1u)) << ((threadIdx.x & 31u) & ~((unsigned)(W) - 1u))))
++/* lanes of a warp-based kernel still inside the row loop: vectors with base row + warpVectorId < nrows */
++__device__ inline unsigned lspmv_live_mask(int64_t row, int64_t warpVectorId, int64_t tpv) {
++	const int64_t lanes = (_cudaNumRows - (row - warpVectorId)) * tpv;
++	return lanes >= 32 ? LSPMV_FULL_MASK : (lanes <= 0 ? 0u : ((1u << lanes) - 1u));
++}
++
++
+ /*device functions*/
+ template < typename T>
+ __device__ inline T shfl_down_64bits(T var, int64_t srcLane,
+@@ -24,8 +37,8 @@ __device__ inline T shfl_down_64bits(T var, int64_t srcLane,
+ 	int2 a = *reinterpret_cast<int2*>(&var);
+ 
+ 	/*exchange the data*/
+-	a.x = __shfl_down(a.x, srcLane, width);
+-	a.y = __shfl_down(a.y, srcLane, width);
++	a.x = __shfl_down_sync(LSPMV_VEC_MASK(width), a.x, srcLane, width);
++	a.y = __shfl_down_sync(LSPMV_VEC_MASK(width), a.y, srcLane, width);
+ 	
+ 	return *reinterpret_cast<T*>(&a);
+ }
+@@ -72,15 +85,17 @@ template < typename T, int64_t THREADS_PER_VECTOR, int64_t MAX_NUM_VECTORS_PER_B
+ 		row = atomicAdd(cudaRowCounter, 32 / THREADS_PER_VECTOR);
+ 	}
+ 	/*broadcast the value to other threads in the same warp and compute the row index of each vector*/
+-	row = __shfl(row, 0) + warpVectorId;
++	row = __shfl_sync(LSPMV_FULL_MASK, row, 0) + warpVectorId;
+ 
+ 	/*check the row range*/
+ 	while (row < _cudaNumRows) {
++		const unsigned liveMask = lspmv_live_mask(row, warpVectorId, THREADS_PER_VECTOR);
+ 
+ 		/*use two threads to fetch the row offset*/
+ 		if (laneId < 2) {
+ 			space[vectorId][laneId] = rowOffsets[row + laneId];
+ 		}
++		__syncwarp(LSPMV_VEC_MASK(THREADS_PER_VECTOR));
+ 		rowStart = space[vectorId][0];
+ 		rowEnd = space[vectorId][1];
+ 
+@@ -110,7 +125,7 @@ template < typename T, int64_t THREADS_PER_VECTOR, int64_t MAX_NUM_VECTORS_PER_B
+ 		}
+ 		/*intra-vector reduction*/
+ 		for (i = THREADS_PER_VECTOR >> 1; i > 0; i >>= 1) {
+-			sum += __shfl_down(sum, i, THREADS_PER_VECTOR);
++			sum += __shfl_down_sync(LSPMV_VEC_MASK(THREADS_PER_VECTOR), sum, i, THREADS_PER_VECTOR);
+ 		}
+ 
+ 		/*save the results and get a new row*/
+@@ -124,7 +139,7 @@ template < typename T, int64_t THREADS_PER_VECTOR, int64_t MAX_NUM_VECTORS_PER_B
+ 			row = atomicAdd(cudaRowCounter, 32 / THREADS_PER_VECTOR);
+ 		}
+ 		/*broadcast the row index to the other threads in the same warp and compute the row index of each vetor*/
+-		row = __shfl(row, 0) + warpVectorId;
++		row = __shfl_sync(liveMask, row, 0) + warpVectorId;
+ 
+ 	}/*while*/
+ }
+@@ -149,7 +164,7 @@ template < typename T, int64_t THREADS_PER_VECTOR, int64_t MAX_NUM_VECTORS_PER_B
+ 		row = atomicAdd(cudaRowCounter, 1);
+ 	}
+ 	/*broadcast the value to other lanes from lane 0*/
+-	row = __shfl(row, 0, THREADS_PER_VECTOR);
++	row = __shfl_sync(LSPMV_VEC_MASK(THREADS_PER_VECTOR), row, 0, THREADS_PER_VECTOR);
+ 
+ 	/*check the row range*/
+ 	while (row < _cudaNumRows) {
+@@ -158,6 +173,7 @@ template < typename T, int64_t THREADS_PER_VECTOR, int64_t MAX_NUM_VECTORS_PER_B
+ 		if (laneId < 2) {
+ 			space[vectorId][laneId] = rowOffsets[row + laneId];
+ 		}
++		__syncwarp(LSPMV_VEC_MASK(THREADS_PER_VECTOR));
+ 		rowStart = space[vectorId][0];
+ 		rowEnd = space[vectorId][1];
+ 
+@@ -187,7 +203,7 @@ template < typename T, int64_t THREADS_PER_VECTOR, int64_t MAX_NUM_VECTORS_PER_B
+ 		}
+ 		/*intra-vector reduction*/
+ 		for (i = THREADS_PER_VECTOR >> 1; i > 0; i >>= 1) {
+-			sum += __shfl_down(sum, i, THREADS_PER_VECTOR);
++			sum += __shfl_down_sync(LSPMV_VEC_MASK(THREADS_PER_VECTOR), sum, i, THREADS_PER_VECTOR);
+ 		}
+ 
+ 		/*save the results and get a new row*/
+@@ -198,7 +214,7 @@ template < typename T, int64_t THREADS_PER_VECTOR, int64_t MAX_NUM_VECTORS_PER_B
+ 			/*get a new row index*/
+ 			row = atomicAdd(cudaRowCounter, 1);
+ 		}
+-		row = __shfl(row, 0, THREADS_PER_VECTOR);
++		row = __shfl_sync(LSPMV_VEC_MASK(THREADS_PER_VECTOR), row, 0, THREADS_PER_VECTOR);
+ 	}/*while*/
+ }
+ 
+@@ -224,15 +240,17 @@ template < typename T, int64_t THREADS_PER_VECTOR, int64_t MAX_NUM_VECTORS_PER_B
+ 			row = atomicAdd(cudaRowCounter, 32 / THREADS_PER_VECTOR);
+ 		}
+ 		/*broadcast the value to other threads in the same warp and compute the row index of each vector*/
+-		row = __shfl(row, 0) + warpVectorId;
++		row = __shfl_sync(LSPMV_FULL_MASK, row, 0) + warpVectorId;
+ 
+ 		/*check the row range*/
+ 		while (row < _cudaNumRows) {
++			const unsigned liveMask = lspmv_live_mask(row, warpVectorId, THREADS_PER_VECTOR);
+ 
+ 			/*use two threads to fetch the row offset*/
+ 			if (laneId < 2) {
+ 				space[vectorId][laneId] = rowOffsets[row + laneId];
+ 			}
++			__syncwarp(LSPMV_VEC_MASK(THREADS_PER_VECTOR));
+ 			rowStart = space[vectorId][0];
+ 			rowEnd = space[vectorId][1];
+ 
+@@ -263,7 +281,7 @@ template < typename T, int64_t THREADS_PER_VECTOR, int64_t MAX_NUM_VECTORS_PER_B
+ 			/*intra-vector reduction*/
+ 			sum *= alpha;
+ 			for (i = THREADS_PER_VECTOR >> 1; i > 0; i >>= 1) {
+-				sum += __shfl_down(sum, i, THREADS_PER_VECTOR);
++				sum += __shfl_down_sync(LSPMV_VEC_MASK(THREADS_PER_VECTOR), sum, i, THREADS_PER_VECTOR);
+ 			}
+ 
+ 			/*save the results and get a new row*/
+@@ -277,7 +295,7 @@ template < typename T, int64_t THREADS_PER_VECTOR, int64_t MAX_NUM_VECTORS_PER_B
+ 				row = atomicAdd(cudaRowCounter, 32 / THREADS_PER_VECTOR);
+ 			}
+ 			/*broadcast the row index to the other threads in the same warp and compute the row index of each vetor*/
+-			row = __shfl(row, 0) + warpVectorId;
++			row = __shfl_sync(liveMask, row, 0) + warpVectorId;
+ 
+ 		}/*while*/
+ 	}
+@@ -302,7 +320,7 @@ template < typename T, int64_t THREADS_PER_VECTOR, int64_t MAX_NUM_VECTORS_PER_B
+ 			row = atomicAdd(cudaRowCounter, 1);
+ 		}
+ 		/*broadcast the value to other lanes from lane 0*/
+-		row = __shfl(row, 0, THREADS_PER_VECTOR);
++		row = __shfl_sync(LSPMV_VEC_MASK(THREADS_PER_VECTOR), row, 0, THREADS_PER_VECTOR);
+ 
+ 		/*check the row range*/
+ 		while (row < _cudaNumRows) {
+@@ -311,6 +329,7 @@ template < typename T, int64_t THREADS_PER_VECTOR, int64_t MAX_NUM_VECTORS_PER_B
+ 			if (laneId < 2) {
+ 				space[vectorId][laneId] = rowOffsets[row + laneId];
+ 			}
++			__syncwarp(LSPMV_VEC_MASK(THREADS_PER_VECTOR));
+ 			rowStart = space[vectorId][0];
+ 			rowEnd = space[vectorId][1];
+ 
+@@ -341,7 +360,7 @@ template < typename T, int64_t THREADS_PER_VECTOR, int64_t MAX_NUM_VECTORS_PER_B
+ 			/*intra-vector reduction*/
+ 			sum *= alpha;
+ 			for (i = THREADS_PER_VECTOR >> 1; i > 0; i >>= 1) {
+-				sum += __shfl_down(sum, i, THREADS_PER_VECTOR);
++				sum += __shfl_down_sync(LSPMV_VEC_MASK(THREADS_PER_VECTOR), sum, i, THREADS_PER_VECTOR);
+ 			}
+ 
+ 			/*save the results and get a new row*/
+@@ -352,7 +371,7 @@ template < typename T, int64_t THREADS_PER_VECTOR, int64_t MAX_NUM_VECTORS_PER_B
+ 				/*get a new row index*/
+ 				row = atomicAdd(cudaRowCounter, 1);
+ 			}
+-			row = __shfl(row, 0, THREADS_PER_VECTOR);
++			row = __shfl_sync(LSPMV_VEC_MASK(THREADS_PER_VECTOR), row, 0, THREADS_PER_VECTOR);
+ 		}/*while*/
+ 	}
+ 
+@@ -377,7 +396,7 @@ __global__ void csr64DynamicVector(unsigned long long* __restrict cudaRowCounter
+ 		row = atomicAdd(cudaRowCounter, 1);
+ 	}
+ 	/*broadcast the value to other lanes from lane 0*/
+-	row = __shfl(row, 0, THREADS_PER_VECTOR);
++	row = __shfl_sync(LSPMV_VEC_MASK(THREADS_PER_VECTOR), row, 0, THREADS_PER_VECTOR);
+ 
+ 	/*check the row range*/
+ 	while (row < _cudaNumRows) {
+@@ -386,6 +405,7 @@ __global__ void csr64DynamicVector(unsigned long long* __restrict cudaRowCounter
+ 		if (laneId < 2) {
+ 			space[vectorId][laneId] = rowOffsets[row + laneId];
+ 		}
++		__syncwarp(LSPMV_VEC_MASK(THREADS_PER_VECTOR));
+ 		rowStart = space[vectorId][0];
+ 		rowEnd = space[vectorId][1];
+ 
+@@ -426,7 +446,7 @@ __global__ void csr64DynamicVector(unsigned long long* __restrict cudaRowCounter
+ 			/*get a new row index*/
+ 			row = atomicAdd(cudaRowCounter, 1);
+ 		}
+-		row = __shfl(row, 0, THREADS_PER_VECTOR);
++		row = __shfl_sync(LSPMV_VEC_MASK(THREADS_PER_VECTOR), row, 0, THREADS_PER_VECTOR);
+ 	}/*while*/
+ }
+ 
+@@ -452,15 +472,17 @@ __global__ void csr64DynamicWarp(unsigned long long* __restrict cudaRowCounter,
+ 		row = atomicAdd(cudaRowCounter, 32 / THREADS_PER_VECTOR);
+ 	}
+ 	/*broadcast the value to other threads in the same warp*/
+-	row = __shfl(row, 0) + warpVectorId;
++	row = __shfl_sync(LSPMV_FULL_MASK, row, 0) + warpVectorId;
+ 
+ 	/*check the row range*/
+ 	while (row < _cudaNumRows) {
++		const unsigned liveMask = lspmv_live_mask(row, warpVectorId, THREADS_PER_VECTOR);
+ 
+ 		/*use two threads to fetch the row offset*/
+ 		if (laneId < 2) {
+ 			space[vectorId][laneId] = rowOffsets[row + laneId];
+ 		}
++		__syncwarp(LSPMV_VEC_MASK(THREADS_PER_VECTOR));
+ 		rowStart = space[vectorId][0];
+ 		rowEnd = space[vectorId][1];
+ 
+@@ -505,7 +527,7 @@ __global__ void csr64DynamicWarp(unsigned long long* __restrict cudaRowCounter,
+ 			row = atomicAdd(cudaRowCounter, 32 / THREADS_PER_VECTOR);
+ 		}
+ 		/*broadcast the value to other threads in the same warp*/
+-		row = __shfl(row, 0) + warpVectorId;
++		row = __shfl_sync(liveMask, row, 0) + warpVectorId;
+ 
+ 	}/*while*/
+ }
+@@ -531,7 +553,7 @@ __global__ void csr64DynamicVectorBLAS(unsigned long long* __restrict cudaRowCou
+ 		row = atomicAdd(cudaRowCounter, 1);
+ 	}
+ 	/*broadcast the value to other lanes from lane 0*/
+-	row = __shfl(row, 0, THREADS_PER_VECTOR);
++	row = __shfl_sync(LSPMV_VEC_MASK(THREADS_PER_VECTOR), row, 0, THREADS_PER_VECTOR);
+ 
+ 	/*check the row range*/
+ 	while (row < _cudaNumRows) {
+@@ -540,6 +562,7 @@ __global__ void csr64DynamicVectorBLAS(unsigned long long* __restrict cudaRowCou
+ 		if (laneId < 2) {
+ 			space[vectorId][laneId] = rowOffsets[row + laneId];
+ 		}
++		__syncwarp(LSPMV_VEC_MASK(THREADS_PER_VECTOR));
+ 		rowStart = space[vectorId][0];
+ 		rowEnd = space[vectorId][1];
+ 
+@@ -581,7 +604,7 @@ __global__ void csr64DynamicVectorBLAS(unsigned long long* __restrict cudaRowCou
+ 			/*get a new row index*/
+ 			row = atomicAdd(cudaRowCounter, 1);
+ 		}
+-		row = __shfl(row, 0, THREADS_PER_VECTOR);
++		row = __shfl_sync(LSPMV_VEC_MASK(THREADS_PER_VECTOR), row, 0, THREADS_PER_VECTOR);
+ 	}/*while*/
+ }
+ 
+@@ -608,15 +631,17 @@ __global__ void csr64DynamicWarpBLAS(unsigned long long* __restrict cudaRowCount
+ 	}
+ 	/*broadcast the value to other threads in the same warp*/
+ 
+-	row = __shfl(row, 0) + warpVectorId;
++	row = __shfl_sync(LSPMV_FULL_MASK, row, 0) + warpVectorId;
+ 
+ 	/*check the row range*/
+ 	while (row < _cudaNumRows) {
++		const unsigned liveMask = lspmv_live_mask(row, warpVectorId, THREADS_PER_VECTOR);
+ 
+ 		/*use two threads to fetch the row offset*/
+ 		if (laneId < 2) {
+ 			space[vectorId][laneId] = rowOffsets[row + laneId];
+ 		}
++		__syncwarp(LSPMV_VEC_MASK(THREADS_PER_VECTOR));
+ 		rowStart = space[vectorId][0];
+ 		rowEnd = space[vectorId][1];
+ 
+@@ -662,7 +687,7 @@ __global__ void csr64DynamicWarpBLAS(unsigned long long* __restrict cudaRowCount
+ 			row = atomicAdd(cudaRowCounter, 32 / THREADS_PER_VECTOR);
+ 		}
+ 		/*broadcast the value to other threads in the same warp*/
+-		row = __shfl(row, 0) + warpVectorId;
++		row = __shfl_sync(liveMask, row, 0) + warpVectorId;
+ 
+ 	}/*while*/
+ }
+-- 
+2.43.0
+

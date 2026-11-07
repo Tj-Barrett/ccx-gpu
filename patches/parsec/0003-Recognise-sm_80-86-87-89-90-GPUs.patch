@@ -1,0 +1,52 @@
+From 7f284059f52219435295593ce2ad132e6998aba9 Mon Sep 17 00:00:00 2001
+From: tj-barrett <barrett.t@northeastern.edu>
+Date: Thu, 15 Oct 2026 21:21:34 -0400
+Subject: [PATCH 3/4] Recognise sm_80/86/87/89/90 GPUs
+
+The capability table stopped at sm_70, so Ampere/Ada/Hopper GPUs were skipped
+('Unsupported GPU 8, 6') and every task ran on the CPU. Rates are per-SM per-clock
+throughputs from the CUDA programming guide; newer GPUs fall back to sm_86 rates.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ parsec/devices/cuda/dev_cuda.c | 24 ++++++++++++++++++++++++
+ 1 file changed, 24 insertions(+)
+
+diff --git a/parsec/devices/cuda/dev_cuda.c b/parsec/devices/cuda/dev_cuda.c
+index 725a7b4c3..86d0a1d78 100644
+--- a/parsec/devices/cuda/dev_cuda.c
++++ b/parsec/devices/cuda/dev_cuda.c
+@@ -121,6 +121,30 @@ static int parsec_cuda_device_lookup_cudamp_floprate(int major, int minor, int *
+         *trate = 512;
+         *srate = 64;
+         *drate = 32;
++    } else if (major == 8 && minor == 0) {   /* A100 */
++        *hrate = 256;
++        *trate = 1024;
++        *srate = 64;
++        *drate = 32;
++    } else if ((major == 8 && minor == 6) ||  /* GA10x (RTX 30xx, A40) */
++               (major == 8 && minor == 7) ||  /* Orin */
++               (major == 8 && minor == 9)) {  /* Ada (RTX 40xx, L40) */
++        *hrate = 256;
++        *trate = 512;
++        *srate = 128;
++        *drate = 2;
++    } else if (major == 9 && minor == 0) {   /* H100 */
++        *hrate = 256;
++        *trate = 1024;
++        *srate = 128;
++        *drate = 64;
++    } else if (major > 9) {
++        /* newer than this table: assume consumer-class rates rather than skip the device */
++        parsec_debug_verbose(3, parsec_cuda_output_stream, "Unknown GPU %d, %d, assuming sm_86 rates.", major, minor);
++        *hrate = 256;
++        *trate = 512;
++        *srate = 128;
++        *drate = 2;
+     } else {
+         parsec_debug_verbose(3, parsec_cuda_output_stream, "Unsupported GPU %d, %d, skipping.", major, minor);
+         return PARSEC_ERROR;
+-- 
+2.43.0
+
