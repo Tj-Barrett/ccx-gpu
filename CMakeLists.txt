@@ -26,9 +26,9 @@ set(PREFIX "${CMAKE_INSTALL_PREFIX}")
 set(CCX_URL "https://www.dhondt.de/ccx_${CCX_VERSION}.src.tar.bz2" CACHE STRING "ccx source tarball")
 set(CCX_SHA256 "9c88385c10fb04f5dc6c4e98027a51bebdd8aee3920e05190d6c1dd08357d6e7" CACHE STRING "")
 
-# METIS 5.1.0 (the Debian/Ubuntu source, GKlib included), built with 64-bit idx_t to match
+# METIS 5.1.0 (the Debian source, GKlib included; same tarball as Ubuntu's archive), built with 64-bit idx_t to match
 # the 64-bit PaStiX
-set(METIS_URL "http://archive.ubuntu.com/ubuntu/pool/universe/m/metis/metis_5.1.0.dfsg.orig.tar.xz"
+set(METIS_URL "http://deb.debian.org/debian/pool/main/m/metis/metis_5.1.0.dfsg.orig.tar.xz"
     CACHE STRING "METIS source tarball")
 set(METIS_SHA256 "c50a88b92b01fa3972c5c92cf50117f126c62589b8f793657c7d865c59c23615" CACHE STRING "")
 
@@ -88,6 +88,7 @@ if(CCX_WITH_PASTIX)
       -DPARSEC_WITH_DEVEL_HEADERS=ON
       -DPARSEC_DIST_WITH_MPI=OFF
       -DPARSEC_GPU_WITH_CUDA=ON
+      -DCMAKE_DISABLE_FIND_PACKAGE_Cython=ON  # skip the pbt2ptt profiling module (install fails without it)
       -DCUDA_TOOLKIT_ROOT_DIR=${CUDA_TOOLKIT_ROOT_DIR}
       -DCUDA_USE_STATIC_CUDA_RUNTIME=OFF
       ${_legacy_cmake})
