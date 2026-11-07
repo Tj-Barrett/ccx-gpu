@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Thomas J. Barrett
 """Copy an RVE benchmark deck and make the matrix viscoelastic: same ZZ tensile
 displacement ramped over 1 s, then held for 40 s (relaxation). Fixed increments so
 every solver takes identical steps.  usage: python make_visco_rve.py <in_pbc.inp> <out.inp>"""

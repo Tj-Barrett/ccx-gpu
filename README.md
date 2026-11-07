@@ -223,6 +223,14 @@ ARPACK and MKL are the stock LP64 packages. CalculiX's own instructions
 
 ## Licenses
 
-CalculiX: GPL-2.0. PaStiX: CeCILL-C. PaRSEC: BSD-3-Clause. Each patch is
-distributed under the license of the project it modifies. The build files in
-this repository are GPL-2.0, like CalculiX.
+| Part | License |
+|---|---|
+| Build files (`CMakeLists.txt`, `ccx/`, `cmake/`) | GPL-2.0-only, like CalculiX ([LICENSE](LICENSE)) |
+| `patches/ccx/` | GPL-2.0-only (CalculiX) |
+| `patches/pastix/` | CeCILL-C (PaStiX) |
+| `patches/parsec/` | BSD-3-Clause (PaRSEC) |
+| `examples/` | MIT ([examples/LICENSE](examples/LICENSE)) |
+
+Each patch is distributed under the license of the project it modifies. CalculiX,
+PaStiX, PaRSEC and METIS (Apache-2.0) are downloaded at build time and are not
+redistributed here. Intel MKL is linked from the system installation.

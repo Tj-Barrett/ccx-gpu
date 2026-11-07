@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (c) 2026 Thomas J. Barrett
 # cmake -DPATCHES="a.patch|b.patch" -P apply_patches.cmake   (run in the source tree)
 # Uses patch(1) rather than git apply: git apply silently skips files when the
 # source tree happens to sit inside another git work tree.

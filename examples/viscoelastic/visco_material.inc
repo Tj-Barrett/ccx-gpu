@@ -1,3 +1,5 @@
+** SPDX-License-Identifier: MIT
+** Copyright (c) 2026 Thomas J. Barrett
 ** Linear viscoelastic matrix (umat_prony_visco.f): E0, nu, N, (g_i, tau_i)
 ** E(t) = E0*(1 - sum g_i (1 - exp(-t/tau_i))),  E_inf = 0.4*E0
 *Material, name=ABAQUS_VISCO

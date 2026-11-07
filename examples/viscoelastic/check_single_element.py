@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Thomas J. Barrett
 """Compare the single-element relaxation test with the closed-form hereditary integral.
 usage: python check_single_element.py single_element.dat"""
 import math

@@ -1,3 +1,5 @@
+** SPDX-License-Identifier: MIT
+** Copyright (c) 2026 Thomas J. Barrett
 ** Uniaxial stress relaxation of one C3D8 cube: ramp to 1% strain in 1 s, hold 40 s
 *Node
 1, 0., 0., 0.

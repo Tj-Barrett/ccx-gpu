@@ -1,3 +1,5 @@
+!     SPDX-License-Identifier: MIT
+!     Copyright (c) 2026 Thomas J. Barrett
 !
 !     Linear viscoelastic material: generalized Maxwell model (Prony series),
 !     isotropic, small strain, constant Poisson's ratio.

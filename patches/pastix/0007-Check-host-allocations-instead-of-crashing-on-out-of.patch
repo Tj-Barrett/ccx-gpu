@@ -19,14 +19,14 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
  CMakeLists.txt                        |  4 ++
  common/memory.h                       |  9 +++-
- common/pastix_alloc_check.h           | 68 +++++++++++++++++++++++++++
+ common/pastix_alloc_check.h           | 70 +++++++++++++++++++++++++++
  refinement/z_refine_bicgstab.c        | 20 ++++----
  refinement/z_refine_gmres.c           | 20 ++++----
  refinement/z_refine_gmres_gpu.c       | 24 +++++-----
  refinement/z_refine_grad.c            |  8 ++--
  refinement/z_refine_pivot.c           |  4 +-
  sopalin/parsec/parsec_sparse_matrix.c |  5 +-
- 9 files changed, 120 insertions(+), 42 deletions(-)
+ 9 files changed, 122 insertions(+), 42 deletions(-)
  create mode 100644 common/pastix_alloc_check.h
 
 diff --git a/CMakeLists.txt b/CMakeLists.txt
@@ -76,11 +76,13 @@ new file mode 100644
 index 0000000..81af636
 --- /dev/null
 +++ b/common/pastix_alloc_check.h
-@@ -0,0 +1,68 @@
+@@ -0,0 +1,70 @@
 +/**
 + * @file pastix_alloc_check.h
 + *
 + * Checked host allocations.
++ *
++ * SPDX-License-Identifier: CECILL-C
 + *
 + * PaStiX (and the PaRSEC task code generated for it) did not check the result of
 + * malloc/calloc/realloc, so running out of memory -- typically while allocating

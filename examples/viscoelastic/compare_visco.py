@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Thomas J. Barrett
 """Compare viscoelastic RVE runs increment by increment against a reference run.
 usage: python compare_visco.py ref.dat other.dat ..."""
 import sys
