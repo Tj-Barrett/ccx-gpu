@@ -62,12 +62,23 @@ ccx with CMake against an existing PaStiX/PaRSEC installation.
 | `CCX_PARDISO_OOC=1` | PARDISO out-of-core when its factor does not fit in the in-core limit; `=2` always; default `0` in-core |
 | `MKL_PARDISO_OOC_MAX_CORE_SIZE` | in-core limit in MB; if unset with `CCX_PARDISO_OOC`, ccx sets it to `CCX_PARDISO_OOC_FRACTION` (default 0.5) of the available RAM |
 | `MKL_PARDISO_OOC_PATH` | prefix of the out-of-core factor files (default `./ooc_temp`, removed at the end); needs free disk of about the factor size |
+| `PASTIX_COMPRESS_TOL=<tol>` | PaStiX block low-rank compression of the factor to `tol` (default off); CPU kernels only, so use with `PASTIX_GPU=0` |
+| `PASTIX_COMPRESS_WHEN` | `begin` (default, least memory), `end` or `during` |
 
 **PARDISO out-of-core** (31 GB machine, C3D10 RVE, one linear step with a UMAT, so two
 factorizations): 1.87M equations, which do not fit in-core, take 1097 s and 15.5 GB of RAM with a
 16.5 GB factor file, matching `ITERATIVE CHOLESKY` to 1e-8. At 2.93M equations the factor
 grows to 56 GB on disk and one factorization took 3.4 h, against 16 min for `ITERATIVE
 CHOLESKY`. Out-of-core is worth it just above the in-core limit, not far beyond it.
+
+**PaStiX low-rank compression** (93 GB machine, 829k-equation C3D10 RVE, linear, 6 load
+cases = 12 factorizations). ccx refines to 1e-12 in at most 70 GMRES iterations, so the
+tolerance must be tight: 1e-4 to 1e-6 stall near 1e-6 and fall back. In mixed precision,
+`PASTIX_COMPRESS_TOL=1e-7` cuts the factor from 13.4 to 7.9 GB and peak RAM from 23 to 18 GB
+with identical moduli, but compressed blocks run on the CPU: 82 min against 190 s
+uncompressed on one GPU. In FP64 (`PASTIX_MIXED_PRECISION=0`) 1e-8 gives 17.2 GB, more than
+the FP32 full-rank factor. `ITERATIVE CHOLESKY` solved the same RVE in 3.1 GB (20 min), and a
+2.2M-equation one in 7.6 GB (about 3 h).
 
 **Note:** when PaStiX is compiled in, it becomes ccx's default solver for
 `*STATIC` without `SOLVER=` (CalculiX's own priority, `ini_cal.c`). Use a
@@ -197,6 +208,9 @@ factorization was about 1e-2 instead of 1e-8. `mymaster` honours it.
 8. One cuBLAS handle per GPU. A single handle, bound to device 0, was shared by
    every GPU task, so cuBLAS tasks scheduled on a second GPU used device 0's
    handle and workspace.
+9. Free the previous low-rank factor on refactorization. This fork no longer
+   releases the coefficient tables between factorizations, and every
+   refactorization with compression on leaked the whole compressed factor.
 
 **CalculiX** (ccx 2.23 tarball)
 
@@ -230,6 +244,8 @@ factorization was about 1e-2 instead of 1e-8. `mymaster` honours it.
 7. PaStiX: ordering selected at run time with `PASTIX_ORDERING` (Scotch or METIS).
 8. PARDISO: optional out-of-core factorization (`CCX_PARDISO_OOC`, see Use). Upstream
    runs PARDISO in-core only.
+9. PaStiX: optional block low-rank compression (`PASTIX_COMPRESS_TOL`, see Use).
+   Upstream hard-codes full-rank factors.
 
 **Integer size.** PaStiX is built with 64-bit integers (`PASTIX_INT64=ON`)
 against the distribution's 64-bit Scotch (`scotch-int64`, linked statically because

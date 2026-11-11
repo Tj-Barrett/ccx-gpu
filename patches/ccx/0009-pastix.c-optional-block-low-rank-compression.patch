@@ -1,0 +1,70 @@
+From: tj-barrett <barrett.t@northeastern.edu>
+Subject: [PATCH] pastix.c: optional block low-rank compression with PASTIX_COMPRESS_TOL
+
+ccx runs PaStiX with full-rank factors only, so the factor memory limits the
+problem size (PaStiX 6 has no out-of-core mode; the factor lives in host RAM,
+the GPU streams blocks from it). PaStiX's block low-rank compression stores
+the large off-diagonal blocks as U V^T to a tolerance; ccx's GMRES refinement
+then brings the solution back to full accuracy.
+
+PASTIX_COMPRESS_TOL=<tol> > 0 sets IPARM_COMPRESS_WHEN and
+DPARM_COMPRESS_TOLERANCE; PASTIX_COMPRESS_WHEN=begin (default, minimal
+memory), end or during. Unset: unchanged. The setting is printed once.
+
+Limits, measured on an 829k-equation C3D10 RVE (FP32 full-rank factor 13.4 GB,
+190 s on one GPU for 12 factorizations):
+- ccx refines to 1e-12 in at most 70 GMRES iterations, so the tolerance must be
+  tight: 1e-4..1e-6 stall (~1e-6) and fall back / refactorize. In mixed
+  precision 1e-7 works: factor 7.9 GB, peak RSS 23 -> 18 GB, same moduli.
+  FP64 (PASTIX_MIXED_PRECISION=0) at 1e-8: 17.2 GB, more than FP32 full rank.
+- Compressed blocks run on the CPU kernels only (the CUDA bodies skip
+  CBLK_COMPRESSED): 393 s per factorization, 82 min in all. Set PASTIX_GPU=0;
+  with the GPU on, BLR raised RSS to 50 GB.
+- Needs pastix patch 0009 (refactorizations leaked the previous LR factor).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+--- a/ccx_2.23/src/pastix.c
++++ b/ccx_2.23/src/pastix.c
+@@ -267,6 +267,41 @@
+ 	piparm[IPARM_MIN_BLOCKSIZE] 			= 1024;
+ 	piparm[IPARM_MAX_BLOCKSIZE] 			= 2048;
+ 	piparm[IPARM_FACTORIZATION] 			= PastixFactLU;
++    {
++        /* PASTIX_COMPRESS_TOL=<tol> turns on block low-rank compression of the
++           factor (off-diagonal blocks stored as U V^T to tolerance tol), which
++           cuts the factor memory. ccx refines to 1e-12 in <= 70 GMRES iterations,
++           so tol must be tight (FP32 factor: ~1e-7; looser tolerances stall and
++           fall back). PASTIX_COMPRESS_WHEN=begin (default, minimal memory:
++           compress before the factorization), end (full-rank update, then
++           compress) or during. Compressed blocks are factorized on the CPU only:
++           run with PASTIX_GPU=0. Needs pastix patch 0009 (LR leak on refactor).
++           Unset or <= 0: no compression (unchanged). */
++        const char* ctol = getenv("PASTIX_COMPRESS_TOL");
++        static int compress_noted = 0;
++        double tol = ctol ? atof(ctol) : 0.;
++        if( tol > 0. ){
++            const char* cwhen = getenv("PASTIX_COMPRESS_WHEN");
++            pastix_compress_when_t when = PastixCompressWhenBegin;
++            if( cwhen && (strcmp(cwhen, "end") == 0 || strcmp(cwhen, "END") == 0) ){
++                when = PastixCompressWhenEnd;
++            }
++            else if( cwhen && (strcmp(cwhen, "during") == 0 || strcmp(cwhen, "DURING") == 0) ){
++                when = PastixCompressWhenDuring;
++            }
++            piparm[IPARM_COMPRESS_WHEN]       = when;
++            pdparm[DPARM_COMPRESS_TOLERANCE]  = tol;
++            if( !compress_noted ){
++                printf(" PaStiX low-rank compression: tolerance %g, when %s\n", tol,
++                       when == PastixCompressWhenBegin ? "begin" : when == PastixCompressWhenEnd ? "end" : "during");
++                compress_noted = 1;
++            }
++        }
++        else if( ctol && !compress_noted ){
++            printf(" PaStiX low-rank compression: PASTIX_COMPRESS_TOL=%s ignored (needs a tolerance > 0)\n", ctol);
++            compress_noted = 1;
++        }
++    }
+ 	piparm[IPARM_TASKS2D_WIDTH] 			= globDoublePrecision ? 256 : 128;
+     piparm[IPARM_REFINEMENT]             = PastixRefineGMRES;
+ 

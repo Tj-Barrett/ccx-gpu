@@ -1,0 +1,41 @@
+From: tj-barrett <barrett.t@northeastern.edu>
+Date: Wed, 11 Nov 2026 12:40:00 -0500
+Subject: [PATCH] Free the previous low-rank factor on refactorization
+
+This fork keeps the factor in reused L/U buffers and no longer calls
+coeftabExit() between numerical factorizations. Dense column blocks are fine,
+but cpucblk_zalloc() reuses each compressed cblk's LRblock array and calls
+core_zlralloc(..., -1, ...) on every block, which mallocs a new full-rank
+buffer without freeing the previous low-rank factor. With
+IPARM_COMPRESS_WHEN != Never, every refactorization (ccx: two per linear
+step) leaked the whole compressed factor: 17 GB per factorization on an
+829k-equation RVE, OOM after a few steps.
+
+Free each block with core_zlrfree() before reallocating it. The array is
+zeroed on first use, so this is a no-op for the first factorization.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+diff --git a/kernels/cpucblk_zinit.c b/kernels/cpucblk_zinit.c
+index ec5adfb..32c25ab 100644
+--- a/kernels/cpucblk_zinit.c
++++ b/kernels/cpucblk_zinit.c
+@@ -76,12 +76,18 @@ cpucblk_zalloc( pastix_coefside_t  side,
+             pastix_int_t nrows = blok_rownbr( blok );
+             blok->LRblock = LRblocks;
+ 
++            /* A refactorization reuses the LRblock array (the coeftab is not
++             * released between factorizations): free the previous low-rank
++             * factor first, or every numerical factorization leaks it. The array
++             * is zeroed on first use, so this is a no-op then. */
+             if ( side != PastixUCoef ) {
++                core_zlrfree( LRblocks );
+                 core_zlralloc( nrows, ncols, -1, LRblocks );
+             }
+             LRblocks++;
+ 
+             if ( side != PastixLCoef ) {
++                core_zlrfree( LRblocks );
+                 core_zlralloc( nrows, ncols, -1, LRblocks );
+             }
+             LRblocks++;
