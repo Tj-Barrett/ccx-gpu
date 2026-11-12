@@ -64,6 +64,7 @@ ccx with CMake against an existing PaStiX/PaRSEC installation.
 | `MKL_PARDISO_OOC_PATH` | prefix of the out-of-core factor files (default `./ooc_temp`, removed at the end); needs free disk of about the factor size |
 | `PASTIX_COMPRESS_TOL=<tol>` | PaStiX block low-rank compression of the factor to `tol` (default off); CPU kernels only, so use with `PASTIX_GPU=0` |
 | `PASTIX_COMPRESS_WHEN` | `begin` (default, least memory), `end` or `during` |
+| `PASTIX_REUSE_FACTOR=0` | factorize on every call; default: skip the factorization when the matrix is bitwise unchanged since the last one (costs one copy of the matrix values) |
 
 **PARDISO out-of-core** (31 GB machine, C3D10 RVE, one linear step with a UMAT, so two
 factorizations): 1.87M equations, which do not fit in-core, take 1097 s and 15.5 GB of RAM with a
@@ -246,6 +247,12 @@ factorization was about 1e-2 instead of 1e-8. `mymaster` honours it.
    runs PARDISO in-core only.
 9. PaStiX: optional block low-rank compression (`PASTIX_COMPRESS_TOL`, see Use).
    Upstream hard-codes full-rank factors.
+10. PaStiX: reuse the factorization of an unchanged matrix (`PASTIX_REUSE_FACTOR`).
+   PaStiX4CalculiX refactorizes on every Newton iteration; a linear model with a
+   UMAT takes 2 per increment, so 6 load cases cost 12 identical factorizations.
+   The values are compared bitwise and numfact is skipped (spm2bcsc still rebuilds
+   the permuted values GMRES uses); ccx's right-hand-side boost now scales b only.
+   829k-equation C3D10 RVE: 11 of 12 reused, 171.6 -> 95.9 s, identical results.
 
 **Integer size.** PaStiX is built with 64-bit integers (`PASTIX_INT64=ON`)
 against the distribution's 64-bit Scotch (`scotch-int64`, linked statically because

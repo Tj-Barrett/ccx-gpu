@@ -1,0 +1,217 @@
+From: tj-barrett <barrett.t@northeastern.edu>
+Subject: [PATCH] pastix.c: reuse the factorization of an unchanged matrix
+
+ccx calls PaStiX once per Newton iteration, and PaStiX4CalculiX runs the
+numerical factorization on every call; its "reuse" only skips the ordering and
+analysis. A linear model on the nonlinear path (any *USER MATERIAL, e.g. the
+fiber-sim UMAT) takes 2 iterations per increment, so a 6-load-case periodic
+RVE factorized the same matrix 12 times.
+
+The scaled CSC values given to the last converged factorization are kept (one
+extra nnz doubles), and numfact is skipped when the new values are bitwise
+identical, the analysis was reused and the precision is the same. The skipped
+call still runs spm2bcsc: bcscInit permutes spm->values in place and the GMRES
+refinement multiplies with that permuted copy. Any failed solve, precision
+switch, pattern change, cleanup or AS/CP mode switch drops the kept values.
+
+ccx's "||b|| getting too small" safeguard multiplied the matrix by the
+right-hand-side boost, so the matrix of every second iteration differed. With
+reuse on, only b is boosted and the solution is divided by the boost
+afterwards; the GMRES residuals are the same.
+
+PASTIX_REUSE_FACTOR=0 restores the previous behaviour exactly (default on).
+
+c15 C3D10 periodic RVE (829k equations, 6 steps x 2 iterations, mixed
+precision, 1 GPU): 11 of 12 factorizations reused, wall time 171.6 -> 95.9 s,
+peak RSS 24.1 -> 24.0 GB, RP displacements and forces identical in the .dat.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+--- a/ccx_2.23/src/pastix.c
++++ b/ccx_2.23/src/pastix.c
+@@ -127,6 +127,56 @@
+ // This is set to one, when to many iterations with mixed precision did not converge
+ char stickToDouble = 0;
+ 
++// Factorization reuse (PASTIX_REUSE_FACTOR, default on; 0 turns it off).
++// ccx calls PaStiX once per Newton iteration, and PaStiX refactorizes on every
++// call even when the matrix has not changed (a linear model on the nonlinear
++// path: 2 iterations per increment; or the next step of a linear model).
++// The scaled CSC values handed to the last successful factorization are kept
++// (copied before numfact: bcscInit permutes spm->values in place), and the
++// numerical factorization is skipped when the new values are bitwise identical.
++// A skipped factorization still runs spm2bcsc, which rebuilds the permuted
++// values the GMRES refinement multiplies with (O(nnz)).
++static double *auFactored = NULL;
++static size_t nFactored = 0;
++static char factoredDouble = -1;
++static char factoredValid = 0;
++char skipFactor = 0;
++
++static char reuse_factor_enabled(void){
++    static int noted = 0;
++    const char *env = getenv("PASTIX_REUSE_FACTOR");
++    char on = !(env && *env == '0');
++    if( !noted ){
++        printf(" PaStiX factorization reuse for unchanged matrices: %s\n", on ? "on" : "off");
++        noted = 1;
++    }
++    return on;
++}
++
++static void factored_invalidate(void){
++    if( auFactored ){
++        free(auFactored);
++        auFactored = NULL;
++    }
++    nFactored = 0;
++    factoredDouble = -1;
++    factoredValid = 0;
++}
++
++// copy the values about to be factorized; valid only once the solve converged
++static void factored_snapshot(size_t nval){
++    if( !reuse_factor_enabled() ) return;
++    if( auFactored == NULL || nFactored != nval ){
++        factored_invalidate();
++        auFactored = malloc(sizeof(double) * nval);
++        if( auFactored == NULL ) return;   // no memory to spare: just do not reuse
++    }
++    memcpy(auFactored, aupastix, sizeof(double) * nval);
++    nFactored = nval;
++    factoredDouble = globDoublePrecision;
++    factoredValid = 0;
++}
++
+ 
+ // Pointers for faster matrix transpose
+ ITG *irowacc = NULL;
+@@ -197,7 +247,8 @@
+ 			ITG *jq, ITG *nzs3){
+ 	// if reusing, only update the value pointer of the sparse matrix
+ 	if(!redo){
+-	    pastixResetSteps(pastix_data);
++	    // keep the factorization steps when the factorization is reused
++	    if( !skipFactor ) pastixResetSteps(pastix_data);
+         if(spm->values != aupastix && spm->values != NULL ) free(spm->values);
+ 		spm->values = aupastix;
+ 
+@@ -833,6 +884,7 @@
+ 	
+ 	// Perform individual invocations always in double precision. If previous iterations were in single precision, do not reuse.
+ 	forceRedo=1;
++	skipFactor = 0;
+ 	globDoublePrecision = 1;
+ 
+ 	// invoke PaStiX
+@@ -853,7 +905,15 @@
+ 			
+ 	if(spm->n == 1)
+ 		return;
+-		
++
++	if( skipFactor ){
++		printf("Reusing the factorization: matrix unchanged\n");
++		pastix_subtask_spm2bcsc( pastix_data, spm );
++		return;
++	}
++
++	// the kept values describe this factorization only once its solve converged
++	factoredValid = 0;
+ 	pastix_task_numfact( pastix_data, spm );
+ }
+ 
+@@ -1021,6 +1081,7 @@
+         }
+ 			
+ 		pastixFinalize( &pastix_data );
++		factored_invalidate();
+ 	}
+ 	
+ 	return;
+@@ -1114,6 +1175,9 @@
+ 	clock_gettime(CLOCK_MONOTONIC, &stepCleanUpEnd); 
+ 	clock_gettime(CLOCK_MONOTONIC, &stepInitStart); 
+ 	
++    // solution scale of the right-hand side boost below (1: none)
++    double xUnscale = 1.0;
++
+     // scale the matrix with diagonals to 1
+     if( *inputformat !=3 && !noScale ){
+         ITG i=0;
+@@ -1134,15 +1198,27 @@
+             printf("||b|| getting too small with scaling, boost it statically\n");
+             double scal = 1e-6/normb;
+ 		    //memcpy(b, b_backup, sizeof(double) * (*nrhs)*(*neq));
+-	        #pragma omp parallel for 
++	        #pragma omp parallel for
+             for(i=0;i<*neq;i++){
+                 b[i] *= scal;
+             }
+ 
+-    	    #pragma omp parallel for 
++            if( reuse_factor_enabled() ){
++                // (D^-1 A) x' = scal D^-1 b with x = x'/scal has the same
++                // residuals as scaling the matrix by scal too, and leaves the
++                // matrix as it was, so its factorization can be reused
++                xUnscale = scal;
++        	    #pragma omp parallel for
++                for(i=0;i<icolpastix[*neq]-1;i++){
++                    aupastix[i] /= ad[irowpastix[i]-1];
++                }
++            }
++            else{
++    	    #pragma omp parallel for
+             for(i=0;i<icolpastix[*neq]-1;i++){
+                 aupastix[i] *= scal/ad[irowpastix[i]-1];
+             }
++            }
+         }
+         else{
+     	    #pragma omp parallel for 
+@@ -1156,6 +1232,19 @@
+ 	// earlier factorization (IPARM_REUSE_LU) as a preconditioner for GMRES
+ 	char freshFactor = forceRedo;
+ 
++	// skip the numerical factorization if the (scaled) matrix is bitwise the one
++	// factorized last; the analysis is reused (!redo) and the precision matches
++	size_t nval = (size_t)(icolpastix[*neq] - 1);
++	skipFactor = 0;
++	if( !redo && !forceRedo && *neq > 1 && factoredValid && nFactored == nval
++	    && factoredDouble == globDoublePrecision && reuse_factor_enabled()
++	    && memcmp(auFactored, aupastix, sizeof(double) * nval) == 0 ){
++		skipFactor = 1;
++	}
++	else if( *neq > 1 && reuse_factor_enabled() ){
++		factored_snapshot(nval);
++	}
++
+ 	//invoke init
+ 	pastix_init(ad,au,adb,aub,sigma,icol,irow, 
+ 		 neq,nzs,symmetryflag,inputformat,jq,nzs3);
+@@ -1229,6 +1318,15 @@
+     }
+ 	else{
+ 		forceRedo = 0;
++		if( xUnscale != 1.0 ){
++			ITG i;
++			#pragma omp parallel for
++			for(i=0;i<*neq;i++){
++				b[i] /= xUnscale;
++			}
++		}
++		// a factorization of this matrix converged: keep its values for reuse
++		if( !skipFactor && auFactored != NULL && nFactored == nval ) factoredValid = 1;
+ 	}
+ 	
+ 	clock_gettime(CLOCK_MONOTONIC, &stepSolveEnd); 
+@@ -1376,6 +1474,9 @@
+ void pastix_set_globals(char mode){
+ 
+     if( modePrev != mode ){
++        // the kept matrix belongs to the previous data set's factorization
++        factored_invalidate();
++        skipFactor = 0;
+         pastix_data_object *temp,*temp2;
+         switch(modePrev){
+             case BASIC:
